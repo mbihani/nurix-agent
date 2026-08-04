@@ -1,5 +1,6 @@
 import asyncio
 import json
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 import mlflow
 from ..config import AppConfig
@@ -85,10 +86,11 @@ async def _generate_chart(sub_question: str, chart_hint: str, genie_result: dict
 
     with mlflow.start_span(name=f"visualizer_chart_{index}") as span:
         span.set_inputs({"question": sub_question, "chart_hint": chart_hint})
-        response = await llm.ainvoke([
-            {"role": "system", "content": CHART_SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ])
+        async with asyncio.timeout(30):
+            response = await llm.ainvoke([
+                {"role": "system", "content": CHART_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ])
         content = response.content
         if isinstance(content, list):
             content = " ".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
@@ -107,17 +109,18 @@ async def _generate_chart(sub_question: str, chart_hint: str, genie_result: dict
     return html
 
 
-async def visualizer_node(state: AgentState, config: dict) -> dict:
+async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
     cfg: AppConfig = config["configurable"]["app_config"]
     emit = state["emit"]
     mode = state.get("mode", "chat")
 
     if mode == "refine":
         llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key="token", model=cfg.claude_model)
-        response = await llm.ainvoke([
-            {"role": "system", "content": REFINE_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Instruction: {state['refine_instruction']}\n\nExisting HTML:\n{state['existing_html']}"},
-        ])
+        async with asyncio.timeout(30):
+            response = await llm.ainvoke([
+                {"role": "system", "content": REFINE_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Instruction: {state['refine_instruction']}\n\nExisting HTML:\n{state['existing_html']}"},
+            ])
         content = response.content
         if isinstance(content, list):
             content = " ".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
@@ -128,10 +131,11 @@ async def visualizer_node(state: AgentState, config: dict) -> dict:
     if mode == "ask_about_viz":
         llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key="token", model=cfg.claude_model)
         user_msg = f"Question: {state['question']}\n\nSQL: {state.get('existing_sql', '')}\n\nChart HTML (contains data):\n{state['existing_html'][:3000]}"
-        response = await llm.ainvoke([
-            {"role": "system", "content": INSIGHT_SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ])
+        async with asyncio.timeout(30):
+            response = await llm.ainvoke([
+                {"role": "system", "content": INSIGHT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ])
         content = response.content
         if isinstance(content, list):
             content = " ".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
