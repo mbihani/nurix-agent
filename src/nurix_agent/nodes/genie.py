@@ -259,11 +259,15 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, to
             return _parse_genie_text_response(raw_text, emit, index)
 
         # Step 2: Poll until completed (max 20 attempts x 3s = 60s).
-        # The poll response is markdown narrative, NOT JSON:
-        #   - in-progress turns start with "Still running" and have no data yet
-        #   - the completed turn contains "**Status:** completed" and the data
-        #     embed blocks (<!-- begin:query_xxx --> / <!-- begin-embedded:... -->)
-        #   - a failed turn contains "**Status:** failed"
+        # The poll response is markdown narrative, NOT JSON. Its lifecycle:
+        #   - in-progress turns start with "Still running". Once Genie starts
+        #     inspecting tables these ALSO contain `<!-- begin:query_xxx -->`
+        #     preview blocks for intermediate steps — so `<!-- begin:` on its
+        #     own is NOT a completion signal (stopping there yields the wrong /
+        #     empty table).
+        #   - the completed turn contains "**Status:** completed" and the final
+        #     data block `<!-- begin-embedded:query_xxx -->`.
+        #   - a failed turn contains "**Status:** failed".
         final_text = raw_text
         for attempt in range(20):
             await asyncio.sleep(3)
@@ -291,13 +295,12 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, to
 
                 lowered = poll_text.lower()
                 is_failed = poll_status == "failed" or "**status:** failed" in lowered
-                # Completion is signalled by the status marker or the presence of
-                # actual result data (embed blocks / SQL). Guard against the
-                # in-progress "Still running" narrative which has neither.
+                # Only the terminal status marker or the final embedded data
+                # block indicate completion. Deliberately NOT `<!-- begin:`,
+                # which also appears in in-progress schema-inspection steps.
                 is_completed = (
                     poll_status == "completed"
                     or "**status:** completed" in lowered
-                    or "<!-- begin:" in poll_text
                     or "<!-- begin-embedded:" in poll_text
                 )
 
