@@ -85,6 +85,28 @@ def _make_sse_stream(initial_state: AgentState):
     return generator()
 
 
+@app.get("/", include_in_schema=False)
+async def root():
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse("""<!DOCTYPE html>
+<html>
+<head><title>nurix-agent</title>
+<style>body{font-family:Arial,sans-serif;background:#1B1B1B;color:#fff;padding:40px;max-width:600px;margin:auto}
+h1{color:#FF3621}code{background:#2a2a2a;padding:2px 8px;border-radius:4px;font-size:14px}
+.ep{margin:12px 0;padding:12px;background:#2a2a2a;border-radius:6px}
+.method{color:#00A972;font-weight:bold;margin-right:8px}</style>
+</head>
+<body>
+<h1>nurix-agent</h1>
+<p>Supervisor LangGraph agent — NL-to-viz on Databricks</p>
+<h3>Endpoints</h3>
+<div class="ep"><span class="method">GET</span><code>/health</code> — liveness check</div>
+<div class="ep"><span class="method">POST</span><code>/chat</code> — NL question → SSE: thinking, genie_text, sql, chart, done</div>
+<div class="ep"><span class="method">POST</span><code>/refine</code> — refine existing chart HTML → SSE: chart, done</div>
+<div class="ep"><span class="method">POST</span><code>/ask_about_viz</code> — ask about a pinned chart → SSE: insight, done</div>
+<p><a href="/docs" style="color:#2272B4">API docs (Swagger)</a></p>
+</body></html>""")
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
