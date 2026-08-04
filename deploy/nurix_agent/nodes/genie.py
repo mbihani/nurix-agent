@@ -1,354 +1,211 @@
 import asyncio
-import json
-import re
+import datetime
+
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.dashboards import GenieMessage, MessageStatus
 from langchain_core.runnables import RunnableConfig
-from langchain_mcp_adapters.client import MultiServerMCPClient
+
 from ..config import AppConfig
 from ..state import AgentState
 
+# Bound the whole Genie conversation (start + internal poll + result fetch) for a
+# single sub-question so one stuck space can't hang the SSE stream forever.
+GENIE_TIMEOUT_SECONDS = 90
 
-def _try_parse_genie_result(content) -> tuple[list[dict], list[list]] | None:
-    """
-    Parse columns and rows from a Genie MCP tool result.
+# Databricks SQL numeric column types (base name, before any precision suffix).
+_NUMERIC_TYPES = {
+    "INT", "INTEGER", "BIGINT", "LONG", "SMALLINT", "TINYINT", "SHORT", "BYTE",
+    "FLOAT", "DOUBLE", "REAL", "DECIMAL", "NUMERIC",
+}
 
-    Handles:
-    - List of content blocks: [{"type": "text", "text": "<json>"}]  (Shape A — streamable_http)
-    - Direct JSON string (Shape B)
-    - Genie native {"content": {"queryAttachments": [{"statement_response": ...}]}} (Shape C)
-    - {"columns": [...], "rows": [...]} (Shape D)
-    - {"result": {"columns": [...], "rows": [...]}} (Shape E)
-    - List of row dicts (Shape F)
-    - Markdown table fallback
-    """
-    # Shape A — list of content blocks; recurse into each text block
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                result = _try_parse_genie_result(block["text"])
-                if result:
-                    return result
-        return None
 
-    if not isinstance(content, str) or len(content) < 10:
-        return None
+def _is_numeric_type(type_text: str | None) -> bool:
+    if not type_text:
+        return False
+    base = type_text.upper().strip().split("(")[0].strip()
+    return base in _NUMERIC_TYPES
 
-    # Try JSON parse
+
+def _coerce(value, numeric: bool):
+    """Cast numeric-column string cells to int/float; leave everything else as-is."""
+    if value is None or not numeric or not isinstance(value, str):
+        return value
+    v = value.replace(",", "").strip()
     try:
-        data = json.loads(content)
-
-        # Shape C — Genie native: {"content": {"queryAttachments": [...]}}
-        if isinstance(data, dict) and "content" in data:
-            attachments = data["content"].get("queryAttachments", [])
-            for att in attachments:
-                sr = att.get("statement_response", {})
-                if sr.get("status", {}).get("state") != "SUCCEEDED":
-                    continue
-                manifest = sr.get("manifest", {})
-                result = sr.get("result", {})
-                schema_cols = manifest.get("schema", {}).get("columns", [])
-                data_array = result.get("data_array", [])  # JSON_ARRAY format
-                if schema_cols and data_array:
-                    cols = [{"name": c["name"], "type": c.get("type_text", "string")}
-                            for c in schema_cols]
-                    rows = []
-                    for row in data_array:
-                        if isinstance(row, list):
-                            rows.append(row)
-                        elif isinstance(row, dict):
-                            vals = [v.get("string_value") for v in row.get("values", [])]
-                            rows.append(vals)
-                    return cols, rows
-
-        # Shape D — {"columns": [...], "rows": [...]}
-        if isinstance(data, dict) and "columns" in data and "rows" in data:
-            cols = [{"name": c if isinstance(c, str) else c.get("name", str(c)), "type": "string"}
-                    for c in data["columns"]]
-            return cols, data["rows"]
-
-        # Shape E — {"result": {"columns": [...], "rows": [...]}}
-        if isinstance(data, dict) and "result" in data:
-            inner = data["result"]
-            if isinstance(inner, dict) and "columns" in inner:
-                cols = [{"name": c.get("name", c) if isinstance(c, dict) else c,
-                         "type": c.get("type", "string") if isinstance(c, dict) else "string"}
-                        for c in inner["columns"]]
-                return cols, inner.get("rows", [])
-
-        # Shape F — list of row dicts
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            cols = [{"name": k, "type": "string"} for k in data[0].keys()]
-            rows = [[r.get(c["name"]) for c in cols] for r in data]
-            return cols, rows
-
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Markdown table fallback
-    lines = [l.strip() for l in content.split("\n") if "|" in l]
-    if len(lines) >= 2:
-        headers = [h.strip() for h in lines[0].split("|") if h.strip()]
-        data_lines = [l for l in lines[2:] if not set(l.replace("|", "").replace("-", "").strip()) <= {""}]
-        if headers and data_lines:
-            cols = [{"name": h, "type": "string"} for h in headers]
-            rows = []
-            for line in data_lines[:100]:
-                vals = [v.strip() for v in line.split("|")]
-                if vals and vals[0] == "":
-                    vals = vals[1:]
-                if vals and vals[-1] == "":
-                    vals = vals[:-1]
-                rows.append(vals[:len(headers)])
-            return cols, rows
-
-    return None
+        if "." in v or "e" in v.lower():
+            return float(v)
+        return int(v)
+    except ValueError:
+        return value
 
 
-def _parse_genie_text_response(text: str, emit, index: int) -> dict:
+def _extract_columns_rows(statement_response) -> tuple[list[dict], list[list]]:
     """
-    Parse Genie's final markdown text response into structured data.
-    Extracts: SQL, narrative text, and table data (columns + rows).
-    """
-    if not text or not text.strip():
-        return {"text": "", "sql": "", "columns": [], "rows": []}
+    Extract columns [{"name","type"}] and rows [[val,...]] from a
+    StatementResponse (Genie query-result payload).
 
-    # Extract SQL from fenced code block
+    Defensive against None / missing manifest / chunked-away result data
+    (data_array is None when the result is paged out).
+    """
+    if statement_response is None:
+        return [], []
+
+    manifest = statement_response.manifest
+    result = statement_response.result
+
+    columns: list[dict] = []
+    numeric_flags: list[bool] = []
+    if manifest and manifest.schema and manifest.schema.columns:
+        for c in manifest.schema.columns:
+            numeric = _is_numeric_type(c.type_text)
+            numeric_flags.append(numeric)
+            columns.append({
+                "name": c.name,
+                "type": "number" if numeric else "string",
+            })
+
+    rows: list[list] = []
+    if result and result.data_array:
+        for row in result.data_array:
+            cells = list(row)
+            if numeric_flags and len(numeric_flags) == len(cells):
+                cells = [_coerce(v, numeric_flags[i]) for i, v in enumerate(cells)]
+            rows.append(cells)
+
+    return columns, rows
+
+
+def _process_message(w: WorkspaceClient, space_id: str, msg: GenieMessage) -> dict:
+    """
+    Turn a terminal GenieMessage into {text, sql, columns, rows}.
+
+    Pulls the SQL/description from the query attachment and the narrative from
+    the text attachment, then fetches the tabular result. The message-level
+    query-result endpoint was observed to return 0 rows for this space, so we
+    fetch the attachment-scoped result (which carries the data) and only fall
+    back to the message-level result if the attachment result is empty.
+    """
+    if msg.status in (MessageStatus.FAILED, MessageStatus.CANCELLED):
+        err = ""
+        if msg.error is not None:
+            err = getattr(msg.error, "error", None) or str(msg.error)
+        return {"text": err or "Genie query failed", "sql": "", "columns": [], "rows": [], "failed": True}
+
     sql = ""
-    sql_match = re.search(r'```sql\s*\n(.*?)\n```', text, re.DOTALL | re.IGNORECASE)
-    if sql_match:
-        sql = sql_match.group(1).strip()
+    description = ""
+    narrative = ""
+    query_attachment_id: str | None = None
 
-    # Extract table data from embedded query blocks (most reliable)
-    # Try <!-- begin-embedded:query_xxx --> ... <!-- end-embedded:query_xxx --> first
-    table_text = ""
-    embedded_match = re.search(
-        r'<!-- begin-embedded:[^>]+ -->\s*\n(.*?)\n<!-- end-embedded:[^>]+ -->',
-        text, re.DOTALL
+    for att in (msg.attachments or []):
+        if att.text is not None and att.text.content:
+            narrative = att.text.content
+        if att.query is not None:
+            sql = att.query.query or sql
+            description = att.query.description or description
+            query_attachment_id = att.attachment_id or query_attachment_id
+
+    text = narrative or description
+
+    columns: list[dict] = []
+    rows: list[list] = []
+    if query_attachment_id is not None:
+        try:
+            res = w.genie.get_message_attachment_query_result(
+                space_id, msg.conversation_id, msg.message_id, query_attachment_id
+            )
+            columns, rows = _extract_columns_rows(res.statement_response)
+        except Exception:
+            columns, rows = [], []
+
+        # Fallback: message-level result (rarely populated for this space, but
+        # cheap to try when the attachment result came back empty/chunked).
+        if not rows:
+            try:
+                res2 = w.genie.get_message_query_result(
+                    space_id, msg.conversation_id, msg.message_id
+                )
+                cols2, rows2 = _extract_columns_rows(res2.statement_response)
+                if rows2:
+                    columns, rows = cols2, rows2
+                elif cols2 and not columns:
+                    columns = cols2
+            except Exception:
+                pass
+
+    return {"text": text, "sql": sql, "columns": columns, "rows": rows}
+
+
+def _run_genie_conversation(space_id: str, host: str, question: str) -> dict:
+    """
+    Blocking Genie conversation for one sub-question, run in a worker thread.
+
+    Uses a fresh WorkspaceClient per call (per-request auth pattern) so the
+    calls run as the deployed app's service principal in prod and as the local
+    user's profile locally. start_conversation_and_wait handles polling until
+    the message reaches a terminal status.
+    """
+    w = WorkspaceClient(host=host)
+    msg = w.genie.start_conversation_and_wait(
+        space_id,
+        question,
+        # Give the SDK poll loop a little less than the outer asyncio budget so
+        # it surfaces a clean SDK timeout before the hard asyncio backstop fires.
+        timeout=datetime.timedelta(seconds=GENIE_TIMEOUT_SECONDS - 5),
     )
-    if embedded_match:
-        table_text = embedded_match.group(1).strip()
-    else:
-        # Try <!-- begin:query_xxx --> ... <!-- end:query_xxx -->
-        begin_match = re.search(
-            r'<!-- begin:[^>]+ -->\s*\n(.*?)\n<!-- end:[^>]+ -->',
-            text, re.DOTALL
-        )
-        if begin_match:
-            table_text = begin_match.group(1).strip()
-
-    # Parse the markdown table
-    columns = []
-    rows = []
-    if table_text:
-        lines = [l.strip() for l in table_text.split('\n') if l.strip()]
-        # Filter out separator lines (| --- | --- |)
-        data_lines = [l for l in lines if l.startswith('|') and not re.match(r'^[\|\s\-:]+$', l)]
-        if len(data_lines) >= 2:
-            # Header row
-            headers = [h.strip() for h in data_lines[0].split('|') if h.strip()]
-            columns = [{"name": h, "type": "string"} for h in headers]
-            # Data rows
-            for line in data_lines[1:]:
-                vals = [v.strip() for v in line.split('|') if v.strip() != '' or True]
-                # Remove empty leading/trailing from split
-                parts = line.split('|')
-                parts = [p.strip() for p in parts]
-                # Remove first and last empty strings from leading/trailing |
-                if parts and parts[0] == '':
-                    parts = parts[1:]
-                if parts and parts[-1] == '':
-                    parts = parts[:-1]
-                if len(parts) == len(headers):
-                    # Try to cast numeric values
-                    row = []
-                    for v in parts:
-                        try:
-                            row.append(int(v.replace(',', '')))
-                        except ValueError:
-                            try:
-                                row.append(float(v.replace(',', '')))
-                            except ValueError:
-                                row.append(v)
-                    rows.append(row)
-                    # Update column types based on data
-                    for i_col, val in enumerate(row):
-                        if isinstance(val, (int, float)) and columns[i_col]["type"] == "string":
-                            columns[i_col]["type"] = "number"
-
-    # If no table found, try the general markdown table parser from _try_parse_genie_result
-    if not columns:
-        parsed = _try_parse_genie_result(text)
-        if parsed:
-            columns, rows = parsed
-
-    # Extract narrative text (everything that's not SQL, not table markers, not HTML comments)
-    narrative = re.sub(r'```sql.*?```', '', text, flags=re.DOTALL | re.IGNORECASE)
-    narrative = re.sub(r'<!--.*?-->', '', narrative, flags=re.DOTALL)
-    narrative = re.sub(r'<!-- begin.*?<!-- end[^>]*>', '', narrative, flags=re.DOTALL)
-    narrative = re.sub(r'\[.*?\]\(https?://.*?\)', '', narrative)  # remove links
-    narrative = re.sub(r'\*\*Status:\*\*.*?\n', '', narrative)
-    narrative = re.sub(r'<details>.*?</details>', '', narrative, flags=re.DOTALL)
-    narrative = re.sub(r'\n{3,}', '\n\n', narrative).strip()
-    # Take first paragraph as the summary
-    paragraphs = [p.strip() for p in narrative.split('\n\n') if p.strip() and not p.strip().startswith('#') and len(p.strip()) > 20]
-    genie_text = paragraphs[0] if paragraphs else ""
-
-    # Emit events
-    if genie_text:
-        emit({"type": "genie_text", "text": genie_text, "index": index})
-    if sql:
-        emit({"type": "sql", "sql": sql, "index": index})
-
-    return {"text": genie_text, "sql": sql, "columns": columns, "rows": rows}
+    return _process_message(w, space_id, msg)
 
 
-async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, token: str, emit) -> dict:
-    """Call workspace-wide Genie MCP for a single sub-question using ask+poll pattern."""
+async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, emit) -> dict:
+    """Query the space-scoped Genie Conversation API for a single sub-question."""
     emit({"type": "thinking", "text": f"Querying Genie for: {question[:60]}...", "index": index})
 
-    mcp_client = MultiServerMCPClient({
-        "genie": {
-            "url": cfg.genie_mcp_url,
-            "transport": "streamable_http",
-            "headers": {
-                "Authorization": f"Bearer {token}",
-                "X-Databricks-Genie-Space-Id": cfg.genie_space_id,
-            }
-        }
-    })
-
+    # SDK Genie calls are blocking (they poll); run in a thread so parallel
+    # sub-questions actually run concurrently and the SSE loop stays responsive.
+    # Catch SDK errors here (e.g. the space's warehouse denying the caller) so
+    # the real cause reaches the client as a clean event instead of surfacing
+    # as an empty "no data" chart or an abrupt disconnect.
     try:
-        tools = await mcp_client.get_tools()
-        if not tools:
-            return {"text": "No Genie tools available", "sql": "", "columns": [], "rows": []}
-
-        # Find genie_ask and genie_poll_response tools
-        ask_tool = next((t for t in tools if t.name == "genie_ask"), None)
-        poll_tool = next((t for t in tools if t.name == "genie_poll_response"), None)
-
-        if not ask_tool:
-            # Fallback: try the first tool with 'question' param
-            ask_tool = next((t for t in tools if "query" in t.name.lower() or "ask" in t.name.lower()), tools[0])
-
-        # Step 1: Call genie_ask
-        ask_result = await ask_tool.ainvoke({"question": question})
-
-        # Extract conversation_id and response_id from ask result
-        conversation_id = None
-        response_id = None
-        ask_status = "unknown"
-
-        raw_text = ""
-        if isinstance(ask_result, list):
-            for block in ask_result:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    raw_text += block.get("text", "")
-        elif isinstance(ask_result, str):
-            raw_text = ask_result
-
-        # Try to parse as JSON to get conversation_id/response_id
-        try:
-            parsed = json.loads(raw_text.strip())
-            conversation_id = parsed.get("conversation_id")
-            response_id = parsed.get("response_id")
-            ask_status = parsed.get("status", "unknown")
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        # If ask returned completed directly (streaming host), parse it now
-        if ask_status == "completed" or (not poll_tool) or (not conversation_id):
-            return _parse_genie_text_response(raw_text, emit, index)
-
-        # Step 2: Poll until completed (max 20 attempts x 3s = 60s).
-        # The poll response is markdown narrative, NOT JSON:
-        #   - in-progress turns start with "Still running" and have no data yet
-        #   - the completed turn contains "**Status:** completed" and the data
-        #     embed blocks (<!-- begin:query_xxx --> / <!-- begin-embedded:... -->)
-        #   - a failed turn contains "**Status:** failed"
-        final_text = raw_text
-        for attempt in range(20):
-            await asyncio.sleep(3)
-            try:
-                poll_result = await poll_tool.ainvoke({
-                    "conversation_id": conversation_id,
-                    "response_id": response_id,
-                })
-                poll_text = ""
-                if isinstance(poll_result, list):
-                    for block in poll_result:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            poll_text += block.get("text", "")
-                elif isinstance(poll_result, str):
-                    poll_text = poll_result
-
-                # Some hosts return a JSON status envelope instead of markdown.
-                poll_status = ""
-                try:
-                    poll_parsed = json.loads(poll_text.strip())
-                    if isinstance(poll_parsed, dict):
-                        poll_status = poll_parsed.get("status", "")
-                except (json.JSONDecodeError, ValueError):
-                    pass
-
-                lowered = poll_text.lower()
-                is_failed = poll_status == "failed" or "**status:** failed" in lowered
-                # Completion is signalled by the status marker or the presence of
-                # actual result data (embed blocks / SQL). Guard against the
-                # in-progress "Still running" narrative which has neither.
-                is_completed = (
-                    poll_status == "completed"
-                    or "**status:** completed" in lowered
-                    or "<!-- begin:" in poll_text
-                    or "<!-- begin-embedded:" in poll_text
-                )
-
-                if is_failed:
-                    emit({"type": "thinking", "text": "Genie query failed", "index": index})
-                    return {"text": "", "sql": "", "columns": [], "rows": []}
-                if is_completed:
-                    final_text = poll_text
-                    break
-                # else still in_progress, keep polling
-            except Exception:
-                if attempt >= 5:
-                    break
-
-        return _parse_genie_text_response(final_text, emit, index)
-
+        result = await asyncio.to_thread(
+            _run_genie_conversation, cfg.genie_space_id, cfg.databricks_host, question
+        )
     except Exception as e:
-        emit({"type": "thinking", "text": f"Genie error: {str(e)[:100]}", "index": index})
+        emit({"type": "thinking", "text": f"Genie query failed: {str(e)[:200]}", "index": index})
         return {"text": "", "sql": "", "columns": [], "rows": []}
+
+    if result.get("failed"):
+        emit({"type": "thinking", "text": f"Genie query failed: {result.get('text', '')[:200]}", "index": index})
+    else:
+        if result.get("text"):
+            emit({"type": "genie_text", "text": result["text"], "index": index})
+        if result.get("sql"):
+            emit({"type": "sql", "sql": result["sql"], "index": index})
+
+    return {
+        "text": result.get("text", ""),
+        "sql": result.get("sql", ""),
+        "columns": result.get("columns", []),
+        "rows": result.get("rows", []),
+    }
 
 
 async def genie_node(state: AgentState, config: RunnableConfig) -> dict:
     cfg: AppConfig = config["configurable"]["app_config"]
     emit = state["emit"]
 
-    # Get token
-    from databricks.sdk import WorkspaceClient
-    ws = WorkspaceClient(host=cfg.databricks_host)
-    auth = ws.config.authenticate()
-    token = auth.get("Authorization", "").replace("Bearer ", "")
-    if not token:
-        emit({"type": "error", "message": "No Databricks token available"})
-        return {"genie_results": []}
-
     sub_questions = state["sub_questions"]
 
     async def _run_with_timeout(q: str, i: int) -> dict:
-        # Bound each sub-question (ask + poll loop ~60s) so one hung task
-        # can't block the whole gather.
+        # Hard backstop around the whole conversation so one hung task can't
+        # block the gather (and thus the SSE stream) indefinitely.
         try:
-            async with asyncio.timeout(90):
-                return await _call_genie_for_question(q, i, cfg, token, emit)
+            async with asyncio.timeout(GENIE_TIMEOUT_SECONDS):
+                return await _call_genie_for_question(q, i, cfg, emit)
         except asyncio.TimeoutError:
             emit({"type": "thinking", "text": f"Genie timed out for: {q[:60]}", "index": i})
             return {"text": "", "sql": "", "columns": [], "rows": []}
 
-    # Run all sub-questions in parallel
-    tasks = [
-        _run_with_timeout(q, i)
-        for i, q in enumerate(sub_questions)
-    ]
+    # Run all sub-questions in parallel.
+    tasks = [_run_with_timeout(q, i) for i, q in enumerate(sub_questions)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     genie_results = []
