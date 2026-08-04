@@ -22,3 +22,14 @@ class AppConfig(BaseSettings):
     @property
     def genie_mcp_url(self) -> str:
         return f"{self.databricks_host.rstrip('/')}/api/2.0/mcp/genie"
+
+
+def get_databricks_token(cfg: 'AppConfig') -> str:
+    """Fetch a fresh Databricks bearer token from the SDK."""
+    from databricks.sdk import WorkspaceClient
+    ws = WorkspaceClient(host=cfg.databricks_host)
+    auth = ws.config.authenticate()
+    token = auth.get("Authorization", "").replace("Bearer ", "").strip()
+    if not token:
+        raise RuntimeError("No Databricks token available. Ensure the workspace is authenticated.")
+    return token

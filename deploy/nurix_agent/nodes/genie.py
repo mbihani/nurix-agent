@@ -1,5 +1,6 @@
 import asyncio
 import json
+from langchain_core.runnables import RunnableConfig
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from ..config import AppConfig
 from ..state import AgentState
@@ -49,9 +50,12 @@ def _try_parse_genie_result(content) -> tuple[list[dict], list[list]] | None:
                     cols = [{"name": c["name"], "type": c.get("type_text", "string")}
                             for c in schema_cols]
                     rows = []
-                    for row_obj in data_array:
-                        vals = [v.get("string_value") for v in row_obj.get("values", [])]
-                        rows.append(vals)
+                    for row in data_array:
+                        if isinstance(row, list):
+                            rows.append(row)
+                        elif isinstance(row, dict):
+                            vals = [v.get("string_value") for v in row.get("values", [])]
+                            rows.append(vals)
                     return cols, rows
 
         # Shape D — {"columns": [...], "rows": [...]}
@@ -118,11 +122,16 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, to
         if not tools:
             return {"text": "No Genie tools available", "sql": "", "columns": [], "rows": []}
 
-        # Find the query tool (first tool available)
-        genie_tool = tools[0]
+        # Find the query tool by name
+        genie_tool = next((t for t in tools if "query" in t.name.lower() or "ask" in t.name.lower()), tools[0])
 
-        # Call the tool
-        raw_result = await genie_tool.ainvoke({"query": question})
+        # Call the tool with timeout
+        try:
+            async with asyncio.timeout(30):
+                raw_result = await genie_tool.ainvoke({"query": question})
+        except asyncio.TimeoutError:
+            emit({"type": "thinking", "text": f"Genie timed out for: {question[:60]}", "index": index})
+            return {"text": "", "sql": "", "columns": [], "rows": []}
 
         # Extract Genie's narrative text response
         genie_text = ""
@@ -176,15 +185,18 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, to
         return {"text": "", "sql": "", "columns": [], "rows": []}
 
 
-async def genie_node(state: AgentState, config: dict) -> dict:
+async def genie_node(state: AgentState, config: RunnableConfig) -> dict:
     cfg: AppConfig = config["configurable"]["app_config"]
     emit = state["emit"]
 
     # Get token
     from databricks.sdk import WorkspaceClient
-    ws = WorkspaceClient()
+    ws = WorkspaceClient(host=cfg.databricks_host)
     auth = ws.config.authenticate()
     token = auth.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        emit({"type": "error", "message": "No Databricks token available"})
+        return {"genie_results": []}
 
     sub_questions = state["sub_questions"]
 

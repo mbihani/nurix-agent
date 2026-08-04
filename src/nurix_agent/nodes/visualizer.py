@@ -3,7 +3,7 @@ import json
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 import mlflow
-from ..config import AppConfig
+from ..config import AppConfig, get_databricks_token
 from ..state import AgentState
 
 VISUALIZATION_GUIDE = (
@@ -73,8 +73,8 @@ Be specific about numbers and trends visible in the data. Do not generate a new 
 """
 
 
-async def _generate_chart(sub_question: str, chart_hint: str, genie_result: dict, cfg: AppConfig, index: int, total: int, emit) -> str:
-    llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key="token", model=cfg.claude_model)
+async def _generate_chart(sub_question: str, chart_hint: str, genie_result: dict, cfg: AppConfig, index: int, total: int, emit, token: str) -> str:
+    llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key=token, model=cfg.claude_model)
 
     # Build data summary for Claude
     columns = genie_result.get("columns", [])
@@ -114,8 +114,10 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
     emit = state["emit"]
     mode = state.get("mode", "chat")
 
+    token = get_databricks_token(cfg)
+
     if mode == "refine":
-        llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key="token", model=cfg.claude_model)
+        llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key=token, model=cfg.claude_model)
         async with asyncio.timeout(30):
             response = await llm.ainvoke([
                 {"role": "system", "content": REFINE_SYSTEM_PROMPT},
@@ -129,7 +131,7 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
         return {"chart_htmls": [html]}
 
     if mode == "ask_about_viz":
-        llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key="token", model=cfg.claude_model)
+        llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key=token, model=cfg.claude_model)
         user_msg = f"Question: {state['question']}\n\nSQL: {state.get('existing_sql', '')}\n\nChart HTML (contains data):\n{state['existing_html'][:3000]}"
         async with asyncio.timeout(30):
             response = await llm.ainvoke([
@@ -150,7 +152,7 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
     total = len(sub_questions)
 
     tasks = [
-        _generate_chart(sub_questions[i], chart_hints[i] if i < len(chart_hints) else "auto", genie_results[i] if i < len(genie_results) else {}, cfg, i, total, emit)
+        _generate_chart(sub_questions[i], chart_hints[i] if i < len(chart_hints) else "auto", genie_results[i] if i < len(genie_results) else {}, cfg, i, total, emit, token)
         for i in range(total)
     ]
     htmls = await asyncio.gather(*tasks, return_exceptions=True)

@@ -39,10 +39,23 @@ app = FastAPI(title="nurix-agent", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+async def run_graph(queue: asyncio.Queue, initial_state: AgentState):
+    """Runs graph and always puts a done sentinel on the queue."""
+    try:
+        await agent_graph.ainvoke(
+            initial_state,
+            config={"configurable": {"app_config": cfg}},
+        )
+    except Exception as e:
+        queue.put_nowait({"type": "error", "message": str(e)})
+    finally:
+        queue.put_nowait({"type": "done"})
 
 
 def _make_sse_stream(initial_state: AgentState):
@@ -55,24 +68,19 @@ def _make_sse_stream(initial_state: AgentState):
     initial_state["emit"] = emit
 
     async def generator():
-        async def run_graph():
+        task = asyncio.create_task(run_graph(queue, initial_state))
+        try:
+            while True:
+                event = await queue.get()
+                yield {"data": json.dumps(event)}
+                if event["type"] in ("done", "error", "rejected"):
+                    break
+        finally:
+            task.cancel()
             try:
-                await agent_graph.ainvoke(
-                    initial_state,
-                    config={"configurable": {"app_config": cfg}},
-                )
-            except Exception as e:
-                queue.put_nowait({"type": "error", "message": str(e)})
-            finally:
-                queue.put_nowait({"type": "done"})
-
-        asyncio.create_task(run_graph())
-
-        while True:
-            event = await queue.get()
-            yield {"data": json.dumps(event)}
-            if event["type"] in ("done", "error", "rejected"):
-                break
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     return generator()
 

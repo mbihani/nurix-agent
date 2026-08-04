@@ -1,7 +1,9 @@
+import asyncio
 import json
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 import mlflow
-from ..config import AppConfig
+from ..config import AppConfig, get_databricks_token
 from ..state import AgentState
 
 ROUTER_SYSTEM_PROMPT = """
@@ -34,7 +36,7 @@ Examples:
 - "what is the weather?" -> is_relevant: false
 """
 
-async def router_node(state: AgentState, config: dict) -> dict:
+async def router_node(state: AgentState, config: RunnableConfig) -> dict:
     cfg: AppConfig = config["configurable"]["app_config"]
     emit = state["emit"]
 
@@ -51,18 +53,24 @@ async def router_node(state: AgentState, config: dict) -> dict:
 
     emit({"type": "thinking", "text": "Analysing your question..."})
 
+    token = get_databricks_token(cfg)
     llm = ChatOpenAI(
         base_url=cfg.ai_gateway_url,
-        api_key="token",
+        api_key=token,
         model=cfg.claude_model,
     )
 
     with mlflow.start_span(name="router") as span:
         span.set_inputs({"question": state["question"]})
-        response = await llm.ainvoke([
-            {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-            {"role": "user", "content": state["question"]},
-        ])
+        try:
+            async with asyncio.timeout(30):
+                response = await llm.ainvoke([
+                    {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+                    {"role": "user", "content": state["question"]},
+                ])
+        except asyncio.TimeoutError:
+            emit({"type": "rejected", "reason": "Router timed out"})
+            return {"is_relevant": False, "rejection_reason": "Router timed out", "sub_questions": [], "chart_hints": []}
         content = response.content
         if isinstance(content, list):
             content = " ".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
@@ -81,7 +89,17 @@ async def router_node(state: AgentState, config: dict) -> dict:
     if not result.get("is_relevant", False):
         emit({"type": "rejected", "reason": result.get("rejection_reason", "Not relevant")})
     else:
-        sub_qs = result.get("sub_questions", [state["question"]])
+        sub_qs = result.get("sub_questions", [])
+        if not isinstance(sub_qs, list) or not sub_qs:
+            sub_qs = [state["question"]]
+        sub_qs = sub_qs[:3]
+        hints = result.get("chart_hints", [])
+        if not isinstance(hints, list):
+            hints = []
+        while len(hints) < len(sub_qs):
+            hints.append("auto")
+        result["sub_questions"] = sub_qs
+        result["chart_hints"] = hints[:len(sub_qs)]
         emit({"type": "thinking", "text": f"Planning {len(sub_qs)} visualization(s)..."})
 
     return {

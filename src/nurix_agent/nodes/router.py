@@ -3,7 +3,7 @@ import json
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 import mlflow
-from ..config import AppConfig
+from ..config import AppConfig, get_databricks_token
 from ..state import AgentState
 
 ROUTER_SYSTEM_PROMPT = """
@@ -53,9 +53,10 @@ async def router_node(state: AgentState, config: RunnableConfig) -> dict:
 
     emit({"type": "thinking", "text": "Analysing your question..."})
 
+    token = get_databricks_token(cfg)
     llm = ChatOpenAI(
         base_url=cfg.ai_gateway_url,
-        api_key="token",
+        api_key=token,
         model=cfg.claude_model,
     )
 
