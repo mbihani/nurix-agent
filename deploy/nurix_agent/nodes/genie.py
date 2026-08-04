@@ -128,7 +128,7 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, to
         # Call the tool with timeout
         try:
             async with asyncio.timeout(30):
-                raw_result = await genie_tool.ainvoke({"query": question})
+                raw_result = await genie_tool.ainvoke({"question": question})
         except asyncio.TimeoutError:
             emit({"type": "thinking", "text": f"Genie timed out for: {question[:60]}", "index": index})
             return {"text": "", "sql": "", "columns": [], "rows": []}
