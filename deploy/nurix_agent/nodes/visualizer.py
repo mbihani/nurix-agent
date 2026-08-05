@@ -124,21 +124,43 @@ def _embed_json(data) -> str:
 
 class _FirstScriptFinder(HTMLParser):
     """
-    Locate the (line, col) of the FIRST real <script> START tag.
+    Locate the (line, col) of the FIRST real, EXECUTABLE <script> START tag.
 
     Subclassing stdlib HTMLParser (no new deps) makes this HTML-context-aware:
     the parser does NOT report a `<script` literal that sits inside an HTML
-    comment (`<!-- <script> -->`) or inside a rawtext element like <textarea> as
+    comment (`<!-- <script> -->`) or inside a <script>/<style> rawtext element as
     a start tag, so those never false-match the way a bare regex would.
+
+    RCDATA elements (<textarea>, <title>) need explicit handling. Browsers treat
+    their contents as raw text, so a `<script></script>` literal inside them is
+    inert markup, never an executable script. Some stdlib versions do NOT
+    implement that RCDATA semantics for these two tags, so a COMPLETE
+    `<script></script>` inside <textarea>/<title> can still fire
+    handle_starttag('script') — which would make us inject window.CHART_DATA
+    INSIDE the textarea/title (inert text), leaving it undefined when the real
+    chart script runs. To be correct on every stdlib version we track RCDATA
+    nesting depth ourselves and only record a <script> position while that depth
+    is 0. This is a no-op on versions where the parser already suppresses the
+    inner <script>, and the needed guard on versions where it does not.
     """
+
+    _RCDATA_TAGS = ("textarea", "title")
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.pos: tuple[int, int] | None = None  # (line, col) of first <script>
+        self._rcdata_depth = 0  # >0 while inside <textarea>/<title>
 
     def handle_starttag(self, tag, attrs):
-        if self.pos is None and tag == "script":
+        if tag in self._RCDATA_TAGS:
+            self._rcdata_depth += 1
+            return
+        if self.pos is None and tag == "script" and self._rcdata_depth == 0:
             self.pos = self.getpos()
+
+    def handle_endtag(self, tag):
+        if tag in self._RCDATA_TAGS and self._rcdata_depth > 0:
+            self._rcdata_depth -= 1
 
 
 def _linecol_to_index(html: str, line: int, col: int) -> int:
@@ -149,20 +171,32 @@ def _linecol_to_index(html: str, line: int, col: int) -> int:
     return min(idx, len(html))
 
 
-def _first_executable_script_index(html: str) -> int | None:
+# Sentinel distinguishing a PARSE FAILURE from a clean parse that found no
+# <script>. The two demand opposite fallbacks: on a parse failure we don't know
+# where any script sits, so the ONLY way to guarantee window.CHART_DATA is
+# defined before anything executes is to PREPEND; a clean no-script result means
+# ordering is irrelevant and the tidy <head> placement is fine.
+_PARSE_FAILED = object()
+
+
+def _first_executable_script_index(html: str):
     """
-    Index of the first EXECUTABLE <script> start tag, or None.
+    Locate the first EXECUTABLE <script> start tag.
+
+    Returns one of three distinct signals:
+      - int           : absolute index of the first executable <script>.
+      - None          : CLEAN parse that found NO executable <script>.
+      - _PARSE_FAILED : the parser raised on malformed input (location unknown).
 
     Uses an HTML-context-aware parse so a `<script` literal inside a comment or a
-    rawtext element (<textarea>, <title>, ...) is ignored. Any parser failure on
-    malformed input returns None (caller then uses the <head>/<html> fallback).
+    RCDATA element (<textarea>, <title>) is ignored rather than false-matching.
     """
     finder = _FirstScriptFinder()
     try:
         finder.feed(html)
         finder.close()
     except Exception:
-        return None
+        return _PARSE_FAILED
     if finder.pos is None:
         return None
     line, col = finder.pos
@@ -175,14 +209,22 @@ def _insert_head_script(html: str, script: str) -> str:
 
     Ordering is unconditional: we place the data <script> immediately before the
     first EXECUTABLE <script> in the document (found via an HTML-context-aware
-    parse, so a `<script` literal inside a comment or rawtext element does not
+    parse, so a `<script` literal inside a comment or RCDATA element does not
     false-match), regardless of where <head> sits — so window.CHART_DATA is
     guaranteed to be defined before the first chart script runs even for a
-    malformed scaffold whose <script> precedes its <head>. When there is no real
-    <script> (or the parse fails), fall back to just-after
-    <head> / <html> / <!DOCTYPE html>, then prepend.
+    malformed scaffold whose <script> precedes its <head>.
+
+    Fallbacks preserve the ordering contract in both no-index cases:
+      - PARSE FAILURE: we cannot locate scripts, so PREPEND the data <script> to
+        the very front of the document — this still guarantees window.CHART_DATA
+        is defined before anything executes. We do NOT use the <head> search
+        here, since that could place data AFTER a script that precedes <head>.
+      - CLEAN parse with NO <script>: ordering is irrelevant, so use the tidy
+        just-after <head> / <html> / <!DOCTYPE html> placement, then prepend.
     """
     idx = _first_executable_script_index(html)
+    if idx is _PARSE_FAILED:
+        return script + html
     if idx is not None:
         return html[:idx] + script + html[idx:]
     for pattern in (r"<head[^>]*>", r"<html[^>]*>", r"<!DOCTYPE html>"):

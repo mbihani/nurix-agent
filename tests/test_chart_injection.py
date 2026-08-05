@@ -8,6 +8,7 @@ module so it exercises shipping code, not a copy.
 import json
 import re
 
+import nurix_agent.nodes.visualizer as viz
 from nurix_agent.nodes.visualizer import (
     _split_chart_data,
     _inject_chart_data,
@@ -194,6 +195,168 @@ def test_no_script_uses_head_fallback():
     print("PASS (f) no <script> -> data injected just after <head> (fallback)")
 
 
+def test_complete_script_in_title_ignored():
+    """(h) A COMPLETE `<script>evil()</script>` literal inside <title> BEFORE the
+    real chart script must NOT be treated as the first executable script. Browsers
+    treat <title> as RCDATA, so the inner script is inert text. Our trusted data
+    block must be injected BEFORE the real chart <script>, NOT inside <title>."""
+    trusted = {"columns": [{"name": "x", "type": "string"}], "rows": [["real"]]}
+    scaffold = (
+        "<!DOCTYPE html><html><head>"
+        "<title>Chart <script>evil()</script> title</title>"
+        "</head><body><canvas></canvas>"
+        "<script id='chart'>const d = window.CHART_DATA;</script>"
+        "</body></html>"
+    )
+    final = _inject_chart_data(scaffold, trusted)
+    assert len(_BLOCK_RE.findall(final)) == 1
+    data_pos = final.index("window.CHART_DATA =")
+    title_close = final.index("</title>")
+    real_pos = final.index("<script id='chart'>")
+    # Data must land AFTER the closing </title> (not inside it) and BEFORE the real script.
+    assert data_pos > title_close, "data injected inside/before the <title> RCDATA"
+    assert data_pos < real_pos, "data not before the real chart script"
+    print("PASS (h) complete <script> inside <title> ignored; data before real script")
+
+
+def test_complete_script_in_textarea_ignored():
+    """(i) A COMPLETE `<script>evil()</script>` literal inside <textarea> BEFORE
+    the real chart script must NOT be treated as the first executable script.
+    <textarea> is RCDATA, so the inner script is inert text; data lands BEFORE the
+    real chart <script>, NOT inside the textarea."""
+    trusted = {"columns": [{"name": "x", "type": "string"}], "rows": [["real"]]}
+    scaffold = (
+        "<!DOCTYPE html><html><head></head><body>"
+        "<textarea>type <script>evil()</script> stuff</textarea>"
+        "<canvas></canvas>"
+        "<script id='chart'>const d = window.CHART_DATA;</script>"
+        "</body></html>"
+    )
+    final = _inject_chart_data(scaffold, trusted)
+    assert len(_BLOCK_RE.findall(final)) == 1
+    data_pos = final.index("window.CHART_DATA =")
+    textarea_close = final.index("</textarea>")
+    real_pos = final.index("<script id='chart'>")
+    assert data_pos > textarea_close, "data injected inside/before the <textarea> RCDATA"
+    assert data_pos < real_pos, "data not before the real chart script"
+    print("PASS (i) complete <script> inside <textarea> ignored; data before real script")
+
+
+def test_parser_exception_prepends_data(monkeypatch):
+    """(j) On a PARSER EXCEPTION we cannot locate scripts, so the data block must
+    be PREPENDED to the very front of the document (index 0) — guaranteeing
+    window.CHART_DATA is defined before ANY other content/script executes. We must
+    NOT fall back to the <head> search, which could place data AFTER a pre-<head>
+    script and reintroduce the ordering bug."""
+    trusted = {"columns": [{"name": "x", "type": "string"}], "rows": [["real"]]}
+    # A scaffold whose FIRST script precedes <head> — the exact shape where a
+    # <head>-based fallback would be WRONG.
+    scaffold = (
+        "<script>console.log('early');</script>"
+        "<!DOCTYPE html><html><head></head><body>"
+        "<script id='chart'>const d = window.CHART_DATA;</script>"
+        "</body></html>"
+    )
+
+    def boom(self, *a, **k):
+        raise ValueError("simulated parser failure")
+
+    # Force the finder to raise on parse.
+    monkeypatch.setattr(viz._FirstScriptFinder, "feed", boom)
+    monkeypatch.setattr(viz._FirstScriptFinder, "close", boom)
+
+    final = _inject_chart_data(scaffold, trusted)
+    assert len(_BLOCK_RE.findall(final)) == 1
+    # Data block is at the very front — before the original document.
+    assert final.startswith("<script>window.CHART_DATA"), (
+        f"data not prepended on parse failure: starts with {final[:40]!r}"
+    )
+    data_pos = final.index("window.CHART_DATA =")
+    early_pos = final.index("console.log('early')")
+    real_pos = final.index("<script id='chart'>")
+    assert data_pos == len("<script>"), f"data not at index 0 region: {data_pos}"
+    assert data_pos < early_pos < real_pos, "data must precede ALL other scripts on exception"
+    print("PASS (j) parser exception -> data PREPENDED before all content")
+
+
+def test_no_regression_all_prior_assertions():
+    """(k) Re-run ALL prior scenarios end-to-end to confirm no regression, and
+    re-assert the full 72-row aggregation totals (negative 2394 / neutral 2298 /
+    positive 2760)."""
+    test_stray_block_yields_exactly_one_trusted_block()
+    test_multiple_stray_blocks_all_stripped()
+    test_script_before_head_ordering()
+    test_full_dataset_aggregation_totals()
+    test_script_literal_in_comment_ignored()
+    test_script_literal_in_textarea_ignored()
+    test_no_script_uses_head_fallback()
+
+    # Explicit re-assertion of the smoke totals through a fresh injection.
+    products = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"]
+    features = ["Search", "Checkout", "Onboarding", "Reports"]
+    sentiments = ["negative", "neutral", "positive"]
+    targets = {"negative": 2394, "neutral": 2298, "positive": 2760}
+    ncells = len(products) * len(features)
+    per = {}
+    for s in sentiments:
+        base = targets[s] // ncells
+        rem = targets[s] - base * ncells
+        per[s] = [base + (1 if i < rem else 0) for i in range(ncells)]
+    rows = []
+    ci = 0
+    for p in products:
+        for f in features:
+            for s in sentiments:
+                rows.append([p, f, s, per[s][ci]])
+            ci += 1
+    data = {
+        "columns": [
+            {"name": "product", "type": "string"},
+            {"name": "feature_area", "type": "string"},
+            {"name": "sentiment_label", "type": "string"},
+            {"name": "review_count", "type": "number"},
+        ],
+        "rows": rows,
+    }
+    html = _inject_chart_data(
+        "<!DOCTYPE html><html><head></head><body>"
+        "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>"
+        "<script>const d=window.CHART_DATA;</script></body></html>",
+        data,
+    )
+    payload = _extract_payload(html)
+    assert len(payload["rows"]) == 72
+    totals = {}
+    for r in payload["rows"]:
+        totals[r[2]] = totals.get(r[2], 0) + r[3]
+    assert totals == targets, f"regression in totals: {totals} != {targets}"
+    print(f"PASS (k) no regression across all prior tests; totals still {totals}")
+
+
+def _run_with_monkeypatch(fn):
+    """Minimal monkeypatch shim so tests run under plain `python` (no pytest)."""
+    import contextlib
+
+    class _MP:
+        def __init__(self):
+            self._undo = []
+
+        def setattr(self, target, name, value):
+            old = getattr(target, name)
+            self._undo.append((target, name, old))
+            setattr(target, name, value)
+
+        def undo(self):
+            for target, name, old in reversed(self._undo):
+                setattr(target, name, old)
+
+    mp = _MP()
+    try:
+        fn(mp)
+    finally:
+        mp.undo()
+
+
 def main():
     test_stray_block_yields_exactly_one_trusted_block()
     test_multiple_stray_blocks_all_stripped()
@@ -202,6 +365,10 @@ def main():
     test_script_literal_in_comment_ignored()
     test_script_literal_in_textarea_ignored()
     test_no_script_uses_head_fallback()
+    test_complete_script_in_title_ignored()
+    test_complete_script_in_textarea_ignored()
+    _run_with_monkeypatch(test_parser_exception_prepends_data)
+    test_no_regression_all_prior_assertions()
     print("\nALL CHART-INJECTION TESTS PASSED")
 
 
