@@ -101,7 +101,7 @@ h1{color:#FF3621}code{background:#2a2a2a;padding:2px 8px;border-radius:4px;font-
 <p>Supervisor LangGraph agent — NL-to-viz on Databricks</p>
 <h3>Endpoints</h3>
 <div class="ep"><span class="method">GET</span><code>/health</code> — liveness check</div>
-<div class="ep"><span class="method">POST</span><code>/chat</code> — NL question → SSE: thinking, genie_text, sql, chart, done</div>
+<div class="ep"><span class="method">POST</span><code>/chat</code> — NL question → SSE: thinking, genie_text, sql, chart, done<br><small>optional <code>deep_research: true</code> → Genie Agent mode: multi-step research, one chart per sub-query (~40-70s)</small></div>
 <div class="ep"><span class="method">POST</span><code>/refine</code> — refine existing chart HTML → SSE: chart, done</div>
 <div class="ep"><span class="method">POST</span><code>/ask_about_viz</code> — ask about a pinned chart → SSE: insight, done</div>
 <p><a href="/docs" style="color:#2272B4">API docs (Swagger)</a></p>
@@ -118,6 +118,7 @@ async def chat(req: ChatRequest):
         "question": req.question,
         "session_id": req.session_id,
         "mode": "chat",
+        "deep_research": req.deep_research,
         "existing_html": None,
         "existing_sql": None,
         "refine_instruction": None,
@@ -139,6 +140,7 @@ async def refine(req: RefineRequest):
         "question": req.instruction,
         "session_id": req.session_id,
         "mode": "refine",
+        "deep_research": False,
         "existing_html": req.chart_html,
         "existing_sql": None,
         "refine_instruction": req.instruction,
@@ -160,6 +162,7 @@ async def ask_about_viz(req: AskAboutVizRequest):
         "question": req.question,
         "session_id": req.session_id,
         "mode": "ask_about_viz",
+        "deep_research": False,
         "existing_html": req.chart_html,
         "existing_sql": req.sql,
         "refine_instruction": None,

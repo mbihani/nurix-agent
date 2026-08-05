@@ -88,6 +88,13 @@ async def router_node(state: AgentState, config: RunnableConfig) -> dict:
 
     if not result.get("is_relevant", False):
         emit({"type": "rejected", "reason": result.get("rejection_reason", "Not relevant")})
+    elif state.get("deep_research"):
+        # Deep research: keep the relevance gate (so an irrelevant question is still
+        # rejected before spending 40-70s) but DISCARD the router's decomposition.
+        # Agent mode decomposes the question itself; keeping both would decompose
+        # twice and fan out one agent run per router sub-question.
+        result["sub_questions"] = [state["question"]]
+        result["chart_hints"] = []
     else:
         sub_qs = result.get("sub_questions", [])
         if not isinstance(sub_qs, list) or not sub_qs:

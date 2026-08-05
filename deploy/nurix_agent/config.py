@@ -15,6 +15,9 @@ class AppConfig(BaseSettings):
     )
     databricks_host: str = Field(default="https://fevm-stable-classic-7ppxjq.cloud.databricks.com", validation_alias="DATABRICKS_HOST")
     genie_space_id: str = Field(default="01f11dcb53181defb69ee49bd73bca10", validation_alias="GENIE_SPACE_ID")
+    # Used only by deep-research (agent) mode, to re-execute the sub-queries Genie
+    # reports SQL for but returns no structured data for.
+    warehouse_id: str = Field(default="24b0352e1b0dca66", validation_alias="WAREHOUSE_ID")
     ai_gateway_url: str = Field(default="https://7474660648944264.ai-gateway.cloud.databricks.com/mlflow/v1", validation_alias="AI_GATEWAY_URL")
     claude_model: str = Field(default="databricks-claude-sonnet-5", validation_alias="CLAUDE_MODEL")
     mlflow_experiment: str = Field(default="nurix-agent-traces", validation_alias="MLFLOW_EXPERIMENT")
