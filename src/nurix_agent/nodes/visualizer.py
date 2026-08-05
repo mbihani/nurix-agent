@@ -123,10 +123,19 @@ def _embed_json(data) -> str:
 
 def _insert_head_script(html: str, script: str) -> str:
     """
-    Insert a <script> as early as possible so the global it defines exists before
-    any chart script runs. Prefer right after the opening <head>; fall back through
-    <html> / <!DOCTYPE html> / prepend so it works even for malformed scaffolds.
+    Insert `script` so the global it defines is defined BEFORE any other script runs.
+
+    Ordering is unconditional: we place the data <script> immediately before the
+    FIRST <script> tag in the document, regardless of where <head> sits — so
+    window.CHART_DATA is guaranteed to be defined before the first chart script
+    executes even for a malformed scaffold whose <script> precedes its <head>.
+    Only when there is no <script> at all do we fall back to just-after
+    <head> / <html> / <!DOCTYPE html>, then prepend.
     """
+    m = re.search(r"<script\b", html, re.IGNORECASE)
+    if m:
+        idx = m.start()
+        return html[:idx] + script + html[idx:]
     for pattern in (r"<head[^>]*>", r"<html[^>]*>", r"<!DOCTYPE html>"):
         m = re.search(pattern, html, re.IGNORECASE)
         if m:
@@ -154,15 +163,23 @@ def _inject_chart_data(html: str, data: dict) -> str:
 
 def _split_chart_data(html: str) -> tuple[str | None, str]:
     """
-    Split out a previously injected window.CHART_DATA <script> from HTML.
+    Remove EVERY window.CHART_DATA <script> block from HTML.
 
-    Returns (data_script or None, html_without_data_script). Used by the refine
-    path so the LLM never has to re-type the data (which would truncate large sets).
+    Returns (first_data_script or None, html_without_any_data_script). Stripping
+    ALL matches (not just the first) is what guarantees idempotency: if the LLM
+    emits its own stray window.CHART_DATA block alongside ours, leaving even one
+    behind would let it execute later and OVERWRITE the global with truncated
+    data. After this + a single re-injection, exactly one block (ours) remains.
+
+    The first match is returned so the refine path can preserve the ORIGINAL
+    full data instead of re-typing it through the LLM.
     """
-    m = _CHART_DATA_RE.search(html)
-    if not m:
+    matches = list(_CHART_DATA_RE.finditer(html))
+    if not matches:
         return None, html
-    return m.group(0), html[: m.start()] + html[m.end():]
+    first = matches[0].group(0)
+    cleaned = _CHART_DATA_RE.sub("", html)
+    return first, cleaned
 
 
 def _strip_fences(content) -> str:
