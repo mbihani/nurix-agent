@@ -138,10 +138,27 @@ class _FirstScriptFinder(HTMLParser):
     `<script></script>` inside <textarea>/<title> can still fire
     handle_starttag('script') — which would make us inject window.CHART_DATA
     INSIDE the textarea/title (inert text), leaving it undefined when the real
-    chart script runs. To be correct on every stdlib version we track RCDATA
-    nesting depth ourselves and only record a <script> position while that depth
-    is 0. This is a no-op on versions where the parser already suppresses the
+    chart script runs. To be correct on every stdlib version we track which
+    RCDATA elements are open ourselves and only record a <script> position while
+    none are. This is a no-op on versions where the parser already suppresses the
     inner <script>, and the needed guard on versions where it does not.
+
+    A SELF-CLOSING `<textarea/>` / `<title/>` is a second, sharper mismatch:
+    stdlib routes it to handle_startendtag, whose default fires handle_starttag
+    THEN handle_endtag — so the element would open and immediately close. But
+    neither tag is a void element in HTML, so a browser leaves `<textarea/>`
+    OPEN and treats everything after it as inert text. We therefore run only the
+    start-side logic for these tags and never let the paired end-callback close
+    them: the element stays open for the rest of the parse, every later <script>
+    is treated as inert (matching the browser), and `pos` stays None. The
+    unterminated state is reported via `unterminated_rcdata` so the caller can
+    choose the conservative PREPEND fallback rather than a <head> placement that
+    could land after a script we deliberately ignored.
+
+    Open RCDATA elements are tracked as a STACK OF TAG NAMES rather than a bare
+    depth counter: a counter desyncs on malformed interleaving (a stray
+    `</textarea>` while only <title> is open would wrongly decrement it), while
+    matching by name closes exactly the element that was opened.
     """
 
     _RCDATA_TAGS = ("textarea", "title")
@@ -149,18 +166,33 @@ class _FirstScriptFinder(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.pos: tuple[int, int] | None = None  # (line, col) of first <script>
-        self._rcdata_depth = 0  # >0 while inside <textarea>/<title>
+        self._rcdata_open: list[str] = []  # names of currently-open RCDATA elements
+
+    @property
+    def unterminated_rcdata(self) -> bool:
+        """True if the parse ended while still inside an RCDATA element."""
+        return bool(self._rcdata_open)
 
     def handle_starttag(self, tag, attrs):
         if tag in self._RCDATA_TAGS:
-            self._rcdata_depth += 1
+            self._rcdata_open.append(tag)
             return
-        if self.pos is None and tag == "script" and self._rcdata_depth == 0:
+        if self.pos is None and tag == "script" and not self._rcdata_open:
             self.pos = self.getpos()
 
     def handle_endtag(self, tag):
-        if tag in self._RCDATA_TAGS and self._rcdata_depth > 0:
-            self._rcdata_depth -= 1
+        if tag in self._RCDATA_TAGS and tag in self._rcdata_open:
+            # Close the matching element (and anything nested inside it).
+            del self._rcdata_open[self._rcdata_open.index(tag):]
+
+    def handle_startendtag(self, tag, attrs):
+        # <textarea/> and <title/> are NOT void elements: a browser leaves them
+        # OPEN. Run only the start-side logic so the paired end-callback that
+        # HTMLParser's default would fire can never close them.
+        if tag in self._RCDATA_TAGS:
+            self.handle_starttag(tag, attrs)
+            return
+        super().handle_startendtag(tag, attrs)
 
 
 def _linecol_to_index(html: str, line: int, col: int) -> int:
@@ -171,11 +203,12 @@ def _linecol_to_index(html: str, line: int, col: int) -> int:
     return min(idx, len(html))
 
 
-# Sentinel distinguishing a PARSE FAILURE from a clean parse that found no
-# <script>. The two demand opposite fallbacks: on a parse failure we don't know
-# where any script sits, so the ONLY way to guarantee window.CHART_DATA is
-# defined before anything executes is to PREPEND; a clean no-script result means
-# ordering is irrelevant and the tidy <head> placement is fine.
+# Sentinel distinguishing an UNLOCATABLE first script from a clean parse that
+# found no <script>. The two demand opposite fallbacks: when we cannot trust any
+# location (parser raised, or the document ended inside an unterminated RCDATA
+# element that renders later scripts inert), the ONLY way to guarantee
+# window.CHART_DATA is defined before anything executes is to PREPEND; a clean
+# no-script result means ordering is irrelevant and tidy <head> placement is fine.
 _PARSE_FAILED = object()
 
 
@@ -186,10 +219,19 @@ def _first_executable_script_index(html: str):
     Returns one of three distinct signals:
       - int           : absolute index of the first executable <script>.
       - None          : CLEAN parse that found NO executable <script>.
-      - _PARSE_FAILED : the parser raised on malformed input (location unknown).
+      - _PARSE_FAILED : the parser raised on malformed input (location unknown),
+                        OR the parse ended still inside an unterminated RCDATA
+                        element having recorded no position — see below.
 
     Uses an HTML-context-aware parse so a `<script` literal inside a comment or a
     RCDATA element (<textarea>, <title>) is ignored rather than false-matching.
+
+    An unterminated RCDATA element (e.g. a self-closing `<textarea/>`, which a
+    browser leaves OPEN) is NOT the same as a clean no-script document: there may
+    genuinely be a later <script> that we deliberately ignored as inert. Reporting
+    None would route to the tidy <head> fallback, which could place the data block
+    AFTER that script. So we report _PARSE_FAILED to force the PREPEND fallback,
+    which guarantees window.CHART_DATA is defined before anything executes.
     """
     finder = _FirstScriptFinder()
     try:
@@ -198,6 +240,8 @@ def _first_executable_script_index(html: str):
     except Exception:
         return _PARSE_FAILED
     if finder.pos is None:
+        if finder.unterminated_rcdata:
+            return _PARSE_FAILED
         return None
     line, col = finder.pos
     return _linecol_to_index(html, line, col)
@@ -215,10 +259,12 @@ def _insert_head_script(html: str, script: str) -> str:
     malformed scaffold whose <script> precedes its <head>.
 
     Fallbacks preserve the ordering contract in both no-index cases:
-      - PARSE FAILURE: we cannot locate scripts, so PREPEND the data <script> to
-        the very front of the document — this still guarantees window.CHART_DATA
-        is defined before anything executes. We do NOT use the <head> search
-        here, since that could place data AFTER a script that precedes <head>.
+      - UNLOCATABLE first script (parser raised, or the document ended inside an
+        unterminated RCDATA element such as a self-closing `<textarea/>` that
+        makes every later script inert): PREPEND the data <script> to the very
+        front of the document — this still guarantees window.CHART_DATA is defined
+        before anything executes. We do NOT use the <head> search here, since that
+        could place data AFTER a script we could not or deliberately did not use.
       - CLEAN parse with NO <script>: ordering is irrelevant, so use the tidy
         just-after <head> / <html> / <!DOCTYPE html> placement, then prepend.
     """

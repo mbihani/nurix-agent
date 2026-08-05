@@ -333,6 +333,102 @@ def test_no_regression_all_prior_assertions():
     print(f"PASS (k) no regression across all prior tests; totals still {totals}")
 
 
+def _assert_data_is_first_script(final: str, label: str):
+    """Assert the injected data block is PREPENDED — before ANY script in the doc."""
+    assert final.startswith("<script>window.CHART_DATA"), (
+        f"{label}: data not prepended; document starts with {final[:48]!r}"
+    )
+    # No other <script> may precede ours anywhere in the document.
+    starts = [m.start() for m in re.finditer(r"<script\b", final, re.IGNORECASE)]
+    assert starts and starts[0] == 0, f"{label}: another <script> precedes ours at {starts[:2]}"
+
+
+def test_self_closing_textarea_forces_prepend():
+    """(l) A SELF-CLOSING `<textarea/>` before the real chart <script>. Browsers do
+    NOT treat <textarea> as a void element, so `<textarea/>` leaves the element OPEN
+    and every later script is inert text. We must therefore NOT record that script
+    as our insertion point, and must NOT degrade to the <head> fallback (which could
+    land AFTER it) — the data block must be PREPENDED to the very front so
+    window.CHART_DATA is defined before ANY script in the document."""
+    trusted = {"columns": [{"name": "x", "type": "string"}], "rows": [["real"]]}
+    scaffold = (
+        "<!DOCTYPE html><html><head></head><body>"
+        "<textarea/>"
+        "<canvas></canvas>"
+        "<script id='chart'>const d = window.CHART_DATA;</script>"
+        "</body></html>"
+    )
+    final = _inject_chart_data(scaffold, trusted)
+    assert len(_BLOCK_RE.findall(final)) == 1
+    _assert_data_is_first_script(final, "(l)")
+    data_pos = final.index("window.CHART_DATA =")
+    assert data_pos < final.index("<textarea/>"), "data must precede the open <textarea/>"
+    assert data_pos < final.index("<script id='chart'>"), "data must precede the chart script"
+    assert _extract_payload(final) == trusted
+    print("PASS (l) self-closing <textarea/> -> data PREPENDED before all scripts")
+
+
+def test_self_closing_title_forces_prepend():
+    """(m) Same as (l) for a SELF-CLOSING `<title/>`: not a void element, so it stays
+    OPEN in a browser and the later chart <script> is inert. Data must be PREPENDED."""
+    trusted = {"columns": [{"name": "x", "type": "string"}], "rows": [["real"]]}
+    scaffold = (
+        "<!DOCTYPE html><html><head><title/></head><body><canvas></canvas>"
+        "<script id='chart'>const d = window.CHART_DATA;</script>"
+        "</body></html>"
+    )
+    final = _inject_chart_data(scaffold, trusted)
+    assert len(_BLOCK_RE.findall(final)) == 1
+    _assert_data_is_first_script(final, "(m)")
+    data_pos = final.index("window.CHART_DATA =")
+    assert data_pos < final.index("<title/>"), "data must precede the open <title/>"
+    assert data_pos < final.index("<script id='chart'>"), "data must precede the chart script"
+    assert _extract_payload(final) == trusted
+    print("PASS (m) self-closing <title/> -> data PREPENDED before all scripts")
+
+
+def test_properly_closed_textarea_still_injects_before_real_script():
+    """(n) REGRESSION GUARD — the conservative prepend must NOT over-trigger. A
+    NORMAL well-formed document whose <textarea> is properly CLOSED before the chart
+    script must still get the precise placement: data injected immediately BEFORE
+    the REAL chart <script>, NOT degraded to a front-of-document prepend."""
+    trusted = {"columns": [{"name": "x", "type": "string"}], "rows": [["real"]]}
+    scaffold = (
+        "<!DOCTYPE html><html><head><title>Chart</title></head><body>"
+        "<textarea>notes go here</textarea>"
+        "<canvas></canvas>"
+        "<script id='chart'>const d = window.CHART_DATA;</script>"
+        "</body></html>"
+    )
+    final = _inject_chart_data(scaffold, trusted)
+    assert len(_BLOCK_RE.findall(final)) == 1
+    # NOT prepended: the healthy document keeps its original prefix.
+    assert final.startswith("<!DOCTYPE html>"), (
+        f"healthy document was degraded to a prepend: starts with {final[:48]!r}"
+    )
+    data_pos = final.index("window.CHART_DATA =")
+    real_pos = final.index("<script id='chart'>")
+    textarea_close = final.index("</textarea>")
+    title_close = final.index("</title>")
+    # Data sits after BOTH closed RCDATA elements and immediately before the real script.
+    assert data_pos > title_close, "data injected inside/before the closed <title>"
+    assert data_pos > textarea_close, "data injected inside/before the closed <textarea>"
+    assert data_pos < real_pos, "data not before the real chart script"
+    assert final.index("<script>window.CHART_DATA") == real_pos - len(
+        _build_data_script(trusted)
+    ), "data block not immediately adjacent to the real chart script"
+    assert _extract_payload(final) == trusted
+    print("PASS (n) properly closed <textarea>/<title> -> precise pre-chart-script injection (no over-trigger)")
+
+
+def test_full_dataset_aggregation_totals_rerun():
+    """(o) Re-run the full-dataset aggregation check after the RCDATA fix: the 72-row
+    product x feature_area x sentiment fixture must still total negative 2394 /
+    neutral 2298 / positive 2760."""
+    test_full_dataset_aggregation_totals()
+    print("PASS (o) full-dataset aggregation re-verified: 2394 / 2298 / 2760")
+
+
 def _run_with_monkeypatch(fn):
     """Minimal monkeypatch shim so tests run under plain `python` (no pytest)."""
     import contextlib
@@ -369,6 +465,10 @@ def main():
     test_complete_script_in_textarea_ignored()
     _run_with_monkeypatch(test_parser_exception_prepends_data)
     test_no_regression_all_prior_assertions()
+    test_self_closing_textarea_forces_prepend()
+    test_self_closing_title_forces_prepend()
+    test_properly_closed_textarea_still_injects_before_real_script()
+    test_full_dataset_aggregation_totals_rerun()
     print("\nALL CHART-INJECTION TESTS PASSED")
 
 
