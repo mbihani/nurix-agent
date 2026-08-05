@@ -19,10 +19,6 @@ class AppConfig(BaseSettings):
     claude_model: str = Field(default="databricks-claude-sonnet-5", validation_alias="CLAUDE_MODEL")
     mlflow_experiment: str = Field(default="nurix-agent-traces", validation_alias="MLFLOW_EXPERIMENT")
 
-    @property
-    def genie_mcp_url(self) -> str:
-        return f"{self.databricks_host.rstrip('/')}/api/2.0/mcp/genie"
-
 
 def get_databricks_token(cfg: 'AppConfig') -> str:
     """Fetch a fresh Databricks bearer token from the SDK."""
