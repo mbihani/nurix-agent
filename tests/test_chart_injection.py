@@ -138,11 +138,70 @@ def test_full_dataset_aggregation_totals():
     print(f"PASS (c) full 72-row aggregation totals correct: {totals}")
 
 
+def test_script_literal_in_comment_ignored():
+    """(d) A `<script` literal inside an HTML comment before the real chart script
+    must NOT be treated as the first script: data lands before the REAL script."""
+    trusted = {"columns": [{"name": "x", "type": "string"}], "rows": [["real"]]}
+    scaffold = (
+        "<!DOCTYPE html><html><head>"
+        "<!-- example usage: <script>foo()</script> -->"
+        "</head><body><canvas></canvas>"
+        "<script id='chart'>const d = window.CHART_DATA;</script>"
+        "</body></html>"
+    )
+    final = _inject_chart_data(scaffold, trusted)
+    assert len(_BLOCK_RE.findall(final)) == 1
+    data_pos = final.index("window.CHART_DATA =")
+    real_pos = final.index("<script id='chart'>")
+    comment_end = final.index("-->")
+    # Injected data must come AFTER the comment (not inside it) and BEFORE the real script.
+    assert data_pos > comment_end, "data injected inside/before the comment"
+    assert data_pos < real_pos, "data not before the real chart script"
+    print("PASS (d) `<script` inside HTML comment ignored; data before real script")
+
+
+def test_script_literal_in_textarea_ignored():
+    """(e) A `<script` literal inside <textarea> rawtext before the real script
+    is ignored; data lands before the REAL executable script."""
+    trusted = {"columns": [{"name": "x", "type": "string"}], "rows": [["real"]]}
+    scaffold = (
+        "<!DOCTYPE html><html><head></head><body>"
+        "<textarea>paste like <script>evil()</script> here</textarea>"
+        "<canvas></canvas>"
+        "<script id='chart'>const d = window.CHART_DATA;</script>"
+        "</body></html>"
+    )
+    final = _inject_chart_data(scaffold, trusted)
+    assert len(_BLOCK_RE.findall(final)) == 1
+    data_pos = final.index("window.CHART_DATA =")
+    textarea_close = final.index("</textarea>")
+    real_pos = final.index("<script id='chart'>")
+    assert data_pos > textarea_close, "data injected inside/before the textarea"
+    assert data_pos < real_pos, "data not before the real chart script"
+    print("PASS (e) `<script` inside <textarea> ignored; data before real script")
+
+
+def test_no_script_uses_head_fallback():
+    """(f) A document with NO <script> falls back to just-after <head>."""
+    trusted = {"columns": [{"name": "x", "type": "string"}], "rows": [["real"]]}
+    scaffold = "<!DOCTYPE html><html><head><title>t</title></head><body><canvas></canvas></body></html>"
+    final = _inject_chart_data(scaffold, trusted)
+    assert len(_BLOCK_RE.findall(final)) == 1
+    head_open_end = final.lower().index("<head>") + len("<head>")
+    data_pos = final.index("<script>window.CHART_DATA")
+    # Data script sits immediately after the opening <head> tag.
+    assert data_pos == head_open_end, f"expected data right after <head>, at {data_pos} vs {head_open_end}"
+    print("PASS (f) no <script> -> data injected just after <head> (fallback)")
+
+
 def main():
     test_stray_block_yields_exactly_one_trusted_block()
     test_multiple_stray_blocks_all_stripped()
     test_script_before_head_ordering()
     test_full_dataset_aggregation_totals()
+    test_script_literal_in_comment_ignored()
+    test_script_literal_in_textarea_ignored()
+    test_no_script_uses_head_fallback()
     print("\nALL CHART-INJECTION TESTS PASSED")
 
 

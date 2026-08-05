@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+from html.parser import HTMLParser
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 import mlflow
@@ -121,26 +122,74 @@ def _embed_json(data) -> str:
     )
 
 
+class _FirstScriptFinder(HTMLParser):
+    """
+    Locate the (line, col) of the FIRST real <script> START tag.
+
+    Subclassing stdlib HTMLParser (no new deps) makes this HTML-context-aware:
+    the parser does NOT report a `<script` literal that sits inside an HTML
+    comment (`<!-- <script> -->`) or inside a rawtext element like <textarea> as
+    a start tag, so those never false-match the way a bare regex would.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.pos: tuple[int, int] | None = None  # (line, col) of first <script>
+
+    def handle_starttag(self, tag, attrs):
+        if self.pos is None and tag == "script":
+            self.pos = self.getpos()
+
+
+def _linecol_to_index(html: str, line: int, col: int) -> int:
+    """Convert HTMLParser's 1-based line / 0-based col to an absolute string index."""
+    lines = html.split("\n")
+    # Sum full prior lines plus their stripped '\n' separators, then add the column.
+    idx = sum(len(lines[i]) + 1 for i in range(line - 1)) + col
+    return min(idx, len(html))
+
+
+def _first_executable_script_index(html: str) -> int | None:
+    """
+    Index of the first EXECUTABLE <script> start tag, or None.
+
+    Uses an HTML-context-aware parse so a `<script` literal inside a comment or a
+    rawtext element (<textarea>, <title>, ...) is ignored. Any parser failure on
+    malformed input returns None (caller then uses the <head>/<html> fallback).
+    """
+    finder = _FirstScriptFinder()
+    try:
+        finder.feed(html)
+        finder.close()
+    except Exception:
+        return None
+    if finder.pos is None:
+        return None
+    line, col = finder.pos
+    return _linecol_to_index(html, line, col)
+
+
 def _insert_head_script(html: str, script: str) -> str:
     """
     Insert `script` so the global it defines is defined BEFORE any other script runs.
 
     Ordering is unconditional: we place the data <script> immediately before the
-    FIRST <script> tag in the document, regardless of where <head> sits — so
-    window.CHART_DATA is guaranteed to be defined before the first chart script
-    executes even for a malformed scaffold whose <script> precedes its <head>.
-    Only when there is no <script> at all do we fall back to just-after
+    first EXECUTABLE <script> in the document (found via an HTML-context-aware
+    parse, so a `<script` literal inside a comment or rawtext element does not
+    false-match), regardless of where <head> sits — so window.CHART_DATA is
+    guaranteed to be defined before the first chart script runs even for a
+    malformed scaffold whose <script> precedes its <head>. When there is no real
+    <script> (or the parse fails), fall back to just-after
     <head> / <html> / <!DOCTYPE html>, then prepend.
     """
-    m = re.search(r"<script\b", html, re.IGNORECASE)
-    if m:
-        idx = m.start()
+    idx = _first_executable_script_index(html)
+    if idx is not None:
         return html[:idx] + script + html[idx:]
     for pattern in (r"<head[^>]*>", r"<html[^>]*>", r"<!DOCTYPE html>"):
         m = re.search(pattern, html, re.IGNORECASE)
         if m:
-            idx = m.end()
-            return html[:idx] + script + html[idx:]
+            end = m.end()
+            return html[:end] + script + html[end:]
     return script + html
 
 
