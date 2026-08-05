@@ -5,6 +5,9 @@ class AgentState(TypedDict):
     question: str
     session_id: str
     mode: str  # "chat" | "refine" | "ask_about_viz"
+    # Opt-in: route to Genie Agent mode (deep research) instead of the plain space
+    # path. False keeps the default behaviour exactly as it was.
+    deep_research: bool
     existing_html: str | None
     existing_sql: str | None
     refine_instruction: str | None
