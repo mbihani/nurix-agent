@@ -79,11 +79,19 @@ def _process_message(w: WorkspaceClient, space_id: str, msg: GenieMessage) -> di
     """
     Turn a terminal GenieMessage into {text, sql, columns, rows}.
 
-    Pulls the SQL/description from the query attachment and the narrative from
-    the text attachment, then fetches the tabular result. The message-level
+    Pulls the SQL/description from the query attachment(s) and the narrative
+    from the text attachment, then fetches the tabular result. The message-level
     query-result endpoint was observed to return 0 rows for this space, so we
     fetch the attachment-scoped result (which carries the data) and only fall
-    back to the message-level result if the attachment result is empty.
+    back to the message-level result when no attachment returns rows.
+
+    A message can carry more than one query attachment; we try each in order and
+    use the first that returns non-empty rows (aligning the emitted SQL/narrative
+    with that attachment) rather than blindly taking the last.
+
+    If a result-retrieval call raises and neither path yields rows, the Databricks
+    error text is returned under "result_error" so the caller can surface it as a
+    clean event instead of silently emitting an empty dataset.
     """
     if msg.status in (MessageStatus.FAILED, MessageStatus.CANCELLED):
         err = ""
@@ -91,48 +99,73 @@ def _process_message(w: WorkspaceClient, space_id: str, msg: GenieMessage) -> di
             err = getattr(msg.error, "error", None) or str(msg.error)
         return {"text": err or "Genie query failed", "sql": "", "columns": [], "rows": [], "failed": True}
 
-    sql = ""
-    description = ""
     narrative = ""
-    query_attachment_id: str | None = None
-
+    query_attachments: list[tuple[str | None, str, str]] = []
     for att in (msg.attachments or []):
         if att.text is not None and att.text.content:
             narrative = att.text.content
         if att.query is not None:
-            sql = att.query.query or sql
-            description = att.query.description or description
-            query_attachment_id = att.attachment_id or query_attachment_id
+            query_attachments.append((
+                att.attachment_id,
+                att.query.query or "",
+                att.query.description or "",
+            ))
 
-    text = narrative or description
+    # Default the SQL/description to the first query attachment so we still emit
+    # a sensible SQL/text even when no attachment ultimately returns rows.
+    sql = query_attachments[0][1] if query_attachments else ""
+    description = query_attachments[0][2] if query_attachments else ""
 
     columns: list[dict] = []
     rows: list[list] = []
-    if query_attachment_id is not None:
+    # First result-retrieval exception seen (attachment path preferred over the
+    # message-level fallback); surfaced only if we end up with no rows.
+    retrieval_error: Exception | None = None
+
+    # Try each query attachment in order; the first that returns non-empty rows
+    # wins, and we align the emitted SQL/description with that attachment.
+    for att_id, att_sql, att_desc in query_attachments:
+        if not att_id:
+            continue
         try:
             res = w.genie.get_message_attachment_query_result(
-                space_id, msg.conversation_id, msg.message_id, query_attachment_id
+                space_id, msg.conversation_id, msg.message_id, att_id
             )
-            columns, rows = _extract_columns_rows(res.statement_response)
-        except Exception:
-            columns, rows = [], []
+            cols_i, rows_i = _extract_columns_rows(res.statement_response)
+        except Exception as e:
+            retrieval_error = retrieval_error or e
+            continue
+        if rows_i:
+            columns, rows = cols_i, rows_i
+            sql = att_sql or sql
+            description = att_desc or description
+            break
+        if cols_i and not columns:
+            columns = cols_i  # keep the schema even if this attachment had no rows
 
-        # Fallback: message-level result (rarely populated for this space, but
-        # cheap to try when the attachment result came back empty/chunked).
-        if not rows:
-            try:
-                res2 = w.genie.get_message_query_result(
-                    space_id, msg.conversation_id, msg.message_id
-                )
-                cols2, rows2 = _extract_columns_rows(res2.statement_response)
-                if rows2:
-                    columns, rows = cols2, rows2
-                elif cols2 and not columns:
-                    columns = cols2
-            except Exception:
-                pass
+    # Fallback: message-level result (rarely populated for this space, but cheap
+    # to try) when no attachment returned rows.
+    if not rows:
+        try:
+            res2 = w.genie.get_message_query_result(
+                space_id, msg.conversation_id, msg.message_id
+            )
+            cols2, rows2 = _extract_columns_rows(res2.statement_response)
+            if rows2:
+                columns, rows = cols2, rows2
+            elif cols2 and not columns:
+                columns = cols2
+        except Exception as e:
+            retrieval_error = retrieval_error or e
 
-    return {"text": text, "sql": sql, "columns": columns, "rows": rows}
+    out = {"text": narrative or description, "sql": sql, "columns": columns, "rows": rows}
+
+    # A retrieval call raised and neither path produced rows: surface the real
+    # Databricks error instead of silently degrading to an empty dataset.
+    if not rows and retrieval_error is not None:
+        out["result_error"] = str(retrieval_error)
+
+    return out
 
 
 def _run_genie_conversation(space_id: str, host: str, question: str) -> dict:
@@ -179,6 +212,10 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, em
             emit({"type": "genie_text", "text": result["text"], "index": index})
         if result.get("sql"):
             emit({"type": "sql", "sql": result["sql"], "index": index})
+        # Narrative/SQL may have been extracted fine while the tabular result
+        # retrieval failed; surface that real error rather than an empty chart.
+        if result.get("result_error"):
+            emit({"type": "thinking", "text": f"Genie result retrieval failed: {result['result_error'][:200]}", "index": index})
 
     return {
         "text": result.get("text", ""),
@@ -209,8 +246,12 @@ async def genie_node(state: AgentState, config: RunnableConfig) -> dict:
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     genie_results = []
-    for r in results:
+    for i, r in enumerate(results):
         if isinstance(r, Exception):
+            # An unexpected error escaped the per-question handling; surface its
+            # text instead of silently substituting an empty dataset.
+            q = sub_questions[i] if i < len(sub_questions) else ""
+            emit({"type": "thinking", "text": f"Genie query failed for '{q[:60]}': {str(r)[:200]}", "index": i})
             genie_results.append({"text": "", "sql": "", "columns": [], "rows": []})
         else:
             genie_results.append(r)
