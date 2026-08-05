@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 import mlflow
@@ -49,6 +50,27 @@ VISUALIZATION_GUIDE = (
     "- NO explanatory text, NO markdown fences, just raw HTML starting with <!DOCTYPE html>\n"
 )
 
+# Well-known JS global that the Python node injects the FULL dataset into after
+# the LLM returns the chart scaffold. The LLM authors JS that READS from this
+# global rather than re-typing data rows inline (which truncates on large
+# result sets and undercounts the chart).
+CHART_DATA_INJECTION_GUIDE = """
+DATA SOURCE — CRITICAL (read carefully):
+- The COMPLETE dataset is injected into the page as a JavaScript global BEFORE your script runs:
+    window.CHART_DATA = {
+      "columns": [ {"name": "<col name>", "type": "number" | "string"}, ... ],
+      "rows":    [ [<cell>, <cell>, ...], ... ]   // each row aligned by position to columns
+    }
+- Build ALL labels, datasets, and aggregations at runtime by iterating over window.CHART_DATA.rows and
+  looking up each column's index by matching its name in window.CHART_DATA.columns.
+- DO NOT hardcode, inline, or re-type ANY data values, labels, or numbers into the HTML/JS. The sample rows
+  shown to you below are ILLUSTRATIVE ONLY and are deliberately truncated — the real dataset lives entirely in
+  window.CHART_DATA and may be far larger. Your JS must work for the FULL dataset, not just the sample.
+- If the chart needs grouping/summing (e.g. totals per category), compute it in JS over window.CHART_DATA.rows.
+- DO NOT declare, reassign, or overwrite window.CHART_DATA — only READ from it. You may alias it locally,
+  e.g. `const data = window.CHART_DATA;`.
+"""
+
 CHART_SYSTEM_PROMPT = VISUALIZATION_GUIDE + """
 Generate a SINGLE self-contained HTML file with:
 - One H3 heading from the question (no other text)
@@ -57,12 +79,19 @@ Generate a SINGLE self-contained HTML file with:
 - Inline <meta http-equiv="Content-Security-Policy" content="connect-src 'none'">
 - Databricks brand colors: primary #FF3621, blue #2272B4, series palette [#2272B4, #FF8C00, #00A36C, #9467BD, #E15759, #76B7B2]
 - window.global = window polyfill not needed (no Plotly)
-"""
+""" + CHART_DATA_INJECTION_GUIDE
 
 REFINE_SYSTEM_PROMPT = """
 You are a chart refinement assistant. The user has an existing Chart.js HTML visualization and wants to modify it.
 Apply the instruction to the existing HTML and return the complete updated HTML.
 Preserve the H3 heading unless the instruction changes the topic.
+
+DATA SOURCE — CRITICAL:
+- The chart's data is supplied at runtime via the JavaScript global window.CHART_DATA
+  (an object with "columns" and "rows"). This global is preserved and re-injected automatically;
+  you will NOT see it in the HTML given to you and you MUST NOT re-create or inline it.
+- Keep building labels/datasets by reading from window.CHART_DATA at runtime. Never hardcode or re-type data rows.
+
 Do NOT add narrative paragraphs. Return ONLY the complete HTML, no markdown.
 """
 
@@ -73,37 +102,115 @@ Be specific about numbers and trends visible in the data. Do not generate a new 
 """
 
 
+def _embed_json(data) -> str:
+    """
+    Serialize data to a JS literal safe to embed inside a <script> element.
+
+    Escapes <, >, & (and the JS line-separator code points) to their \\uXXXX
+    forms so the payload can never terminate the <script> tag early ("</script>"),
+    open an HTML comment, or otherwise break out of the JS context — while still
+    parsing back to the exact original characters at runtime.
+    """
+    return (
+        json.dumps(data, ensure_ascii=False, default=str)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _insert_head_script(html: str, script: str) -> str:
+    """
+    Insert a <script> as early as possible so the global it defines exists before
+    any chart script runs. Prefer right after the opening <head>; fall back through
+    <html> / <!DOCTYPE html> / prepend so it works even for malformed scaffolds.
+    """
+    for pattern in (r"<head[^>]*>", r"<html[^>]*>", r"<!DOCTYPE html>"):
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            idx = m.end()
+            return html[:idx] + script + html[idx:]
+    return script + html
+
+
+# Matches the data block this node injects. The payload can never contain a
+# literal "</script>" (escaped by _embed_json), so the first closer is ours.
+_CHART_DATA_RE = re.compile(
+    r"<script>\s*window\.CHART_DATA\s*=.*?</script>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _build_data_script(data: dict) -> str:
+    return f"<script>window.CHART_DATA = {_embed_json(data)};</script>"
+
+
+def _inject_chart_data(html: str, data: dict) -> str:
+    """Embed the FULL columns+rows payload as a window.CHART_DATA global (no row cap)."""
+    return _insert_head_script(html, _build_data_script(data))
+
+
+def _split_chart_data(html: str) -> tuple[str | None, str]:
+    """
+    Split out a previously injected window.CHART_DATA <script> from HTML.
+
+    Returns (data_script or None, html_without_data_script). Used by the refine
+    path so the LLM never has to re-type the data (which would truncate large sets).
+    """
+    m = _CHART_DATA_RE.search(html)
+    if not m:
+        return None, html
+    return m.group(0), html[: m.start()] + html[m.end():]
+
+
+def _strip_fences(content) -> str:
+    if isinstance(content, list):
+        content = " ".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
+    html = content.strip()
+    if html.startswith("```html"):
+        html = html[7:]
+    if html.startswith("```"):
+        html = html[3:]
+    if html.endswith("```"):
+        html = html[:-3]
+    return html.strip()
+
+
 async def _generate_chart(sub_question: str, chart_hint: str, genie_result: dict, cfg: AppConfig, index: int, total: int, emit, token: str) -> str:
     llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key=token, model=cfg.claude_model)
 
-    # Build data summary for Claude
+    # Full structured Genie result. The LLM only sees the schema + a tiny sample
+    # (to pick chart type / axis mapping); the ACTUAL data is injected below so it
+    # never gets re-typed and truncated in LLM output.
     columns = genie_result.get("columns", [])
-    rows = genie_result.get("rows", [])[:50]  # limit rows
-    col_names = [c["name"] if isinstance(c, dict) else str(c) for c in columns]
-    data_summary = f"Columns: {col_names}\nRows (first 50): {rows}"
+    rows = genie_result.get("rows", [])
+    sample_rows = rows[:5]
+    schema_desc = ", ".join(
+        f"{c['name']} ({c['type']})" if isinstance(c, dict) else str(c) for c in columns
+    )
+    data_summary = (
+        f"Columns ({len(columns)}): {schema_desc}\n"
+        f"Total rows: {len(rows)}\n"
+        f"Sample rows (first {len(sample_rows)} of {len(rows)} — SAMPLE ONLY, "
+        f"read the full data from window.CHART_DATA): {sample_rows}"
+    )
 
     user_msg = f"Question: {sub_question}\nChart hint: {chart_hint}\n\nData:\n{data_summary}"
 
     with mlflow.start_span(name=f"visualizer_chart_{index}") as span:
-        span.set_inputs({"question": sub_question, "chart_hint": chart_hint})
+        span.set_inputs({"question": sub_question, "chart_hint": chart_hint, "row_count": len(rows)})
         async with asyncio.timeout(30):
             response = await llm.ainvoke([
                 {"role": "system", "content": CHART_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ])
-        content = response.content
-        if isinstance(content, list):
-            content = " ".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
-        # Strip markdown fences
-        html = content.strip()
-        if html.startswith("```html"):
-            html = html[7:]
-        if html.startswith("```"):
-            html = html[3:]
-        if html.endswith("```"):
-            html = html[:-3]
-        html = html.strip()
-        span.set_outputs({"html_length": len(html)})
+        html = _strip_fences(response.content)
+        # Defensive: drop any data block the LLM emitted, then inject the real one.
+        _, html = _split_chart_data(html)
+        html = _inject_chart_data(html, {"columns": columns, "rows": rows})
+        span.set_outputs({"html_length": len(html), "row_count": len(rows)})
 
     emit({"type": "chart", "html": html, "index": index, "total": total})
     return html
@@ -118,15 +225,20 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
 
     if mode == "refine":
         llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key=token, model=cfg.claude_model)
+        # Pull the injected data block out so the LLM refines only the scaffold and
+        # never has to re-type (and thus truncate) the data; re-inject it afterward.
+        existing_html = state["existing_html"] or ""
+        data_script, scaffold = _split_chart_data(existing_html)
         async with asyncio.timeout(30):
             response = await llm.ainvoke([
                 {"role": "system", "content": REFINE_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Instruction: {state['refine_instruction']}\n\nExisting HTML:\n{state['existing_html']}"},
+                {"role": "user", "content": f"Instruction: {state['refine_instruction']}\n\nExisting HTML:\n{scaffold}"},
             ])
-        content = response.content
-        if isinstance(content, list):
-            content = " ".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
-        html = content.strip().lstrip("```html").lstrip("```").rstrip("```").strip()
+        html = _strip_fences(response.content)
+        if data_script is not None:
+            # Preserve the ORIGINAL full data (never round-tripped through the LLM).
+            _, html = _split_chart_data(html)
+            html = _insert_head_script(html, data_script)
         emit({"type": "chart", "html": html, "index": 0, "total": 1})
         return {"chart_htmls": [html]}
 
