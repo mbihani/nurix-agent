@@ -521,20 +521,36 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
                     f"attempted; {len(survivors)} rendered successfully.",
         })
 
-    total = len(survivors)
-    chart_htmls: list[str] = []
-    for new_index, (orig_index, html) in enumerate(survivors):
+    # SECOND reducing pass, and it MUST complete before `total` is computed.
+    #
+    # A deep-research candidate reaching this point was admitted with a non-empty SQL
+    # upstream, so an empty one means that invariant broke. Emitting the chart anyway
+    # would ship an empty `sql` masquerading as a pinnable query; emitting a
+    # `{"sql": ""}` event would do the same. So the entry is DROPPED and reported.
+    #
+    # Dropping here removes a survivor, so numbering has to happen after this pass —
+    # computing `total` before it would reintroduce the gap-plus-inflated-total bug
+    # from the other direction.
+    emittable: list[tuple[int, str]] = []
+    for orig_index, html in survivors:
         result = genie_results[orig_index] if orig_index < len(genie_results) else {}
-        sql = result.get("sql") or ""
-        # Every candidate reaching this point was admitted with a non-empty SQL by
-        # the upstream node, so an empty one here means that contract broke. Say so
-        # rather than shipping a chart whose `sql` silently vanished.
-        if not sql.strip():
+        sql = (result.get("sql") or "").strip()
+        if emit_sql and not sql:
+            label = sub_questions[orig_index] if orig_index < len(sub_questions) else f"chart {orig_index}"
             emit({
                 "type": "thinking",
-                "text": f"Chart {new_index} is missing the SQL that produced it; "
-                        f"it cannot be pinned or refined with its query.",
+                "text": f"Not charting '{label[:80]}': the SQL that produced it is "
+                        f"missing, so the chart could not be pinned or refined.",
             })
+            continue
+        emittable.append((orig_index, html))
+
+    # Numbering is assigned only now, over the entries actually being emitted.
+    total = len(emittable)
+    chart_htmls: list[str] = []
+    for new_index, (orig_index, html) in enumerate(emittable):
+        result = genie_results[orig_index] if orig_index < len(genie_results) else {}
+        sql = result.get("sql") or ""
         if emit_sql:
             # Deferred from the deep-research node so this index matches the chart
             # that actually rendered, letting a consumer pair sql -> chart.

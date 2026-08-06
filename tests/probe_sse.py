@@ -249,6 +249,18 @@ def main():
           f"{all(c.get('chart_total') == len(charts) for c in charts)}")
     print(f"CONTRACT every chart has non-empty sql: "
           f"{all((c.get('sql') or '').strip() for c in charts)}")
+    if not deep:
+        # A duplicate sql event on the plain path was a real regression once; pin it.
+        print(f"CONTRACT plain-path sql event count == 1: {n_sql == 1} (got {n_sql})")
+    # No column that reads as an identifier/calendar part may be charted as a measure.
+    suspects = ("_id", "id", "zip", "postal", "phone", "year", "month", "uuid", "sku")
+    for c in charts:
+        payload = parse_chart_data(c.get("html") or "")
+        names = [(cc.get("name") or "").lower() for cc in (payload or {}).get("columns", [])]
+        flagged = [n for n in names if n in suspects or n.endswith("_id")]
+        if flagged:
+            print(f"  NOTE chart {c.get('chart_index')} carries id/date-like columns "
+                  f"{flagged} — check they are dimensions, not the plotted measure")
     return 0
 
 

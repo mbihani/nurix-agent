@@ -309,12 +309,60 @@ def test_chart_event_omits_sql_rather_than_faking_an_empty_one():
     assert viz._chart_event("<html></html>", index=0, total=1, sql=SQL)["sql"] == SQL
 
 
-def test_missing_sql_at_emission_is_surfaced_not_papered_over():
-    """Defence in depth: if the upstream contract broke, say so."""
-    events, _ = _run_visualizer(["q0"], _results_for(["q0"], sql=""))
-    assert any("missing the SQL that produced it" in t for t in _thinking(events)), \
+def test_missing_sql_at_emission_drops_the_entry_entirely():
+    """
+    FIX B: reporting the broken invariant is not enough — emitting the chart plus a
+    `{"sql": ""}` event still ships an empty string masquerading as a query.
+    """
+    events, out = _run_visualizer(["q0"], _results_for(["q0"], sql=""))
+    assert any("the SQL that produced it is missing" in t for t in _thinking(events)), \
         _thinking(events)
-    assert "sql" not in _charts(events)[0], _charts(events)[0]
+    assert _charts(events) == [], "a chart with no sql must not be emitted"
+    assert _sqls(events) == [], "an empty sql event must not be emitted"
+    assert out["chart_htmls"] == []
+
+
+def test_middle_entry_with_empty_sql_is_dropped_and_the_rest_renumbered():
+    """
+    FIX B's dense-index requirement: the drop removes a survivor, so `total` and the
+    indices must be computed AFTER it — otherwise a gap plus an inflated chart_total
+    reintroduces BLOCKER 4 from the other direction.
+    """
+    qs = ["first", "middle", "last"]
+    results = [
+        {"text": "", "sql": "SELECT 1", "columns": [STR, NUM], "rows": [["a", 1], ["b", 2]]},
+        {"text": "", "sql": "", "columns": [STR, NUM], "rows": [["a", 1], ["b", 2]]},
+        {"text": "", "sql": "SELECT 3", "columns": [STR, NUM], "rows": [["a", 1], ["b", 2]]},
+    ]
+    events, out = _run_visualizer(qs, results)
+
+    charts, sqls = _charts(events), _sqls(events)
+    assert len(charts) == 2, f"expected 2 charts, got {len(charts)}"
+    assert [c["chart_index"] for c in charts] == [0, 1], charts
+    assert all(c["chart_total"] == 2 for c in charts), charts
+    assert [c["index"] for c in charts] == [0, 1], "legacy alias must be dense too"
+    assert all(c["total"] == 2 for c in charts), charts
+    assert len(sqls) == 2, f"expected 2 sql events, got {len(sqls)}"
+    assert [s["chart_index"] for s in sqls] == [0, 1], sqls
+    # Survivors keep their original order and their real SQL.
+    assert [c["sql"] for c in charts] == ["SELECT 1", "SELECT 3"], charts
+    assert all((s["sql"] or "").strip() for s in sqls), sqls
+    # The dropped one is named.
+    assert any("middle" in t and "the SQL that produced it is missing" in t
+               for t in _thinking(events)), _thinking(events)
+    assert len(out["chart_htmls"]) == 2
+
+
+def test_plain_path_empty_sql_still_charts():
+    """
+    The FIX B drop is deep-research only. The plain path emits its own sql event from
+    genie_node and has no index pairing to protect, so a missing sql there must not
+    cost the user their chart.
+    """
+    events, out = _run_visualizer(["q0"], _results_for(["q0"], sql=""), deep_research=False)
+    assert len(_charts(events)) == 1, "plain path must still chart"
+    assert "sql" not in _charts(events)[0], "but must not fake an empty sql"
+    assert len(out["chart_htmls"]) == 1
 
 
 def test_zero_chart_fallback_never_picks_a_sqlless_result():
@@ -418,33 +466,118 @@ def test_failed_subqueries_are_dropped_without_a_duplicate_message():
 # WARNING 8 — a measure typed STRING must not be falsely dropped
 # --------------------------------------------------------------------------
 
-def test_string_typed_numeric_column_is_treated_as_chartable():
-    """Genie sometimes types a real measure as STRING; values are the tie-breaker."""
-    str_count = {"name": "review_count", "type": "string"}
+def _str_col(name):
+    return {"name": name, "type": "string"}
+
+
+def _rescued(name, values):
+    """Whether a string-TYPED column called `name` holding `values` is rescued."""
+    rows = [[f"label{i}", v] for i, v in enumerate(values)]
+    return _has_numeric_column([STR, _str_col(name)], rows)
+
+
+def test_formatting_evidence_rescues_a_string_typed_measure():
+    """FIX A signal 1: %, currency and thousands separators are measure formatting."""
+    # Even with a neutral, non-measure-ish name, the FORMATTING carries the rescue.
+    assert _rescued("value", ["42%", "31.5%", "8%"])
+    assert _rescued("value", ["$12.50", "$9.99"])
+    assert _rescued("value", ["1,234", "5,678"])
+    # And end to end through the filter.
+    pct = _str_col("some_metric")
+    sq = _sq("negative rate by area",
+             [["billing", "42%"], ["search", "31.5%"], ["auth", "8%"]],
+             columns=(STR, pct))
+    assert _recon_skip_reason(sq) is None, _recon_skip_reason(sq)
+
+
+def test_measure_name_evidence_rescues_bare_digit_strings():
+    """FIX A signal 2: a measure-ish NAME rescues values with no formatting."""
+    assert _rescued("review_count", ["10", "20"])
+    for name in ("total_reviews", "sum_amount", "negative_rate", "avg_score",
+                 "pct_of_total", "revenue", "unit_price", "qty", "num_reviews",
+                 "median_delta", "growth", "ratio"):
+        assert _rescued(name, ["10", "20"]), f"{name} should be rescued"
+    # End to end through the filter.
     sq = _sq("negative reviews by area",
              [["billing", "120"], ["search", "84"], ["auth", "31"]],
-             columns=(STR, str_count))
+             columns=(STR, _str_col("review_count")))
     assert _recon_skip_reason(sq) is None, _recon_skip_reason(sq)
-    assert _has_numeric_column([STR, str_count], sq["rows"])
 
 
-def test_formatted_numeric_strings_are_still_measures():
-    """Pre-formatted values ("42%", "1,234") remain plottable magnitudes."""
-    pct = {"name": "negative_rate_pct", "type": "string"}
-    rows = [["billing", "42%"], ["search", "31.5%"], ["auth", "8%"]]
-    assert _has_numeric_column([STR, pct], rows)
-    assert _column_values_are_numeric([["a", "1,234"], ["b", "5,678"]], 1)
-    assert _column_values_are_numeric([["a", "$12.50"], ["b", "$9.99"]], 1)
+def test_identifier_like_digit_columns_are_never_rescued():
+    """
+    FIX A's core: parseability is STORAGE REPRESENTATION, not measure SEMANTICS.
+    Ids, years and ZIPs all parse — charting them on a value axis is nonsense.
+    """
+    for name, values in (
+        ("customer_id", ["10001", "10002"]),
+        ("id", ["1", "2"]),
+        ("zip_code", ["560001", "110001"]),
+        ("postal_code", ["560001", "110001"]),
+        ("year", ["2023", "2024"]),
+        ("review_year", ["2023", "2024"]),
+        ("month", ["1", "2"]),
+        ("phone_number", ["5551234567", "5559876543"]),
+        ("order_number", ["100234", "100235"]),
+        ("account", ["8812", "8813"]),
+        ("uuid", ["12345", "67890"]),
+        ("sku", ["1001", "1002"]),
+    ):
+        assert not _rescued(name, values), f"{name} must NOT be rescued as a measure"
+    # A bare digit run with a neutral name has NO evidence either way -> no rescue.
+    assert not _rescued("value", ["2023", "2024"])
+    assert not _rescued("col_a", ["10001", "10002"])
+
+
+def test_identifier_veto_outranks_measure_name_evidence():
+    """'order_number'/'account_total' carry BOTH signals; the veto must win."""
+    assert not _rescued("order_number", ["100234", "100235"])
+    assert not _rescued("account_number", ["8812", "8813"])
+    assert not _rescued("id_count", ["10", "20"])
+    # ...and the veto holds even against formatting evidence.
+    assert not _rescued("customer_id", ["1,234", "5,678"])
 
 
 def test_genuinely_textual_column_is_still_dropped():
     """The conservative half: one stray label means it is text, not a measure."""
     sq = _sq("feature areas", [["billing", "high"], ["search", "low"]],
-             columns=(STR, {"name": "urgency", "type": "string"}))
+             columns=(STR, _str_col("urgency")))
     assert _recon_skip_reason(sq) is not None
+    assert not _rescued("some_metric", ["alpha", "beta"])
+    # Even a measure-ish name cannot rescue non-numeric values.
+    assert not _rescued("review_count", ["alpha", "beta"])
     # A single non-numeric value disqualifies the whole column.
     assert not _column_values_are_numeric([["a", "12"], ["b", "N/A"], ["c", "34"]], 1)
     assert not _column_values_are_numeric([["a", "billing"]], 1)
+    assert not _rescued("review_count", ["12", "N/A", "34"])
+
+
+def test_parseability_alone_is_not_a_chartability_test():
+    """
+    `_column_values_are_numeric` answers PARSEABILITY only; the measure decision
+    belongs to `_has_numeric_column`. Pinned so nobody re-wires the former as a
+    chartability gate and reopens FIX A.
+    """
+    # Both parse...
+    assert _column_values_are_numeric([["a", "2023"], ["b", "2024"]], 1)
+    assert _column_values_are_numeric([["a", "10001"], ["b", "10002"]], 1)
+    # ...but neither is chartable as a measure.
+    assert not _has_numeric_column([STR, _str_col("year")],
+                                   [["a", "2023"], ["b", "2024"]])
+    assert not _has_numeric_column([STR, _str_col("customer_id")],
+                                   [["a", "10001"], ["b", "10002"]])
+
+
+def test_value_sniffing_only_ever_adds_a_numeric_column():
+    """Ordering contract: a real numeric TYPE is never removed by value sniffing."""
+    # An id column typed as a real number stays numeric — the veto must not apply
+    # to type-based detection, only to the string rescue.
+    assert _has_numeric_column([{"name": "customer_id", "type": "number"}])
+    assert _has_numeric_column([{"name": "year", "type": "BIGINT"}],
+                               [["2023"], ["2024"]])
+    # Passing rows can only ever turn False into True, never the reverse.
+    cols = [STR, NUM]
+    assert _has_numeric_column(cols) and _has_numeric_column(cols, [["a", 1]])
 
 
 def test_value_based_detection_is_conservative_about_edge_cases():
@@ -704,6 +837,44 @@ def test_plain_path_does_not_duplicate_the_sql_event():
     # The chart still carries its own sql, so pairing never depends on the sql event.
     assert all(c.get("sql") == SQL for c in _charts(events)), _charts(events)
     assert len(_charts(events)) == 3
+
+
+def test_plain_path_generation_failure_is_explained_and_yields_no_chart():
+    """
+    FIX C, option (i) — the plain path's early `sql` emit (genie_node, before
+    generation) is DELIBERATE and pinned here.
+
+    Rationale for keeping it: the plain path has no indexed chart array to desync
+    (the consumer stores the sql string on the message for a collapsible badge), the
+    failure is already explained by a thinking event, and deferring would delay
+    useful feedback on EVERY plain query (~26s -> ~30s) to guard an edge case that
+    is already visible. What this test pins is that the failure stays EXPLAINED: a
+    plain sql with no chart must always be accompanied by a reason.
+    """
+    events, out = _run_visualizer(
+        ["only question"], _results_for(["only question"]),
+        fail_indices={0}, deep_research=False,
+    )
+    assert _charts(events) == [], "a failed generation must not emit a chart"
+    # The visualizer emits no sql on the plain path (genie_node already did), so the
+    # user's sql badge comes from there while the explanation comes from here.
+    assert _sqls(events) == []
+    thinking = _thinking(events)
+    assert any("only question" in t and "Could not render" in t for t in thinking), thinking
+    assert any("1 chart attempted; 0 rendered successfully" in t for t in thinking), thinking
+    assert out["chart_htmls"] == []
+
+
+def test_plain_path_partial_failure_still_charts_the_rest():
+    """A plain question can plan up to 3 sub-questions; one failure must not sink them."""
+    qs = ["q0", "q1", "q2"]
+    events, out = _run_visualizer(qs, _results_for(qs), fail_indices={1},
+                                  deep_research=False)
+    charts = _charts(events)
+    assert [c["chart_index"] for c in charts] == [0, 1], charts
+    assert all(c["chart_total"] == 2 for c in charts), charts
+    assert any("q1" in t and "Could not render" in t for t in _thinking(events))
+    assert len(out["chart_htmls"]) == 2
 
 
 def test_deep_research_path_emits_one_sql_per_rendered_chart():
