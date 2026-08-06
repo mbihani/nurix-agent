@@ -332,7 +332,41 @@ def _strip_fences(content) -> str:
     return html.strip()
 
 
-async def _generate_chart(sub_question: str, chart_hint: str, genie_result: dict, cfg: AppConfig, index: int, total: int, emit, token: str) -> str:
+def _chart_event(html: str, *, index: int, total: int, sql: str | None) -> dict:
+    """
+    Build THE chart SSE event — the single construction site for every emitter.
+
+    Centralized deliberately: the refine path used to build its own chart event by
+    hand and so missed `chart_index`/`chart_total` entirely when they were added
+    here. One builder means that class of drift cannot recur.
+
+    `chart_index`/`chart_total` are the names the nurix-nlviz consumer reads (its
+    multi-chart branch is `typeof event.chart_total === 'number' && > 1`).
+    `index`/`total` are kept as an INTENTIONAL COMPATIBILITY ALIAS so the already
+    deployed nurix-nlviz proxy, which passes events straight through, keeps working
+    — no flag-day where one app is redeployed and the other is not. Do not remove
+    either pair without redeploying both apps.
+
+    `sql` is a REQUIRED argument (no default) so no caller can silently forget it.
+    When it is genuinely absent the key is OMITTED rather than set to "": an empty
+    string masquerades as a query the consumer could pin or refine, whereas a
+    missing key is an honest "no SQL for this chart". Callers are expected to
+    surface that absence rather than pass it along quietly.
+    """
+    event = {
+        "type": "chart",
+        "html": html,
+        "chart_index": index,
+        "chart_total": total,
+        "index": index,
+        "total": total,
+    }
+    if sql and sql.strip():
+        event["sql"] = sql
+    return event
+
+
+async def _generate_chart(sub_question: str, chart_hint: str, genie_result: dict, cfg: AppConfig, index: int, token: str, on_done=None) -> str:
     llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key=token, model=cfg.claude_model)
 
     # Full structured Genie result. The LLM only sees the schema + a tiny sample
@@ -366,22 +400,12 @@ async def _generate_chart(sub_question: str, chart_hint: str, genie_result: dict
         html = _inject_chart_data(html, {"columns": columns, "rows": rows})
         span.set_outputs({"html_length": len(html), "row_count": len(rows)})
 
-    # `chart_index`/`chart_total` are the names the nurix-nlviz consumer reads
-    # (its multi-chart branch is `typeof event.chart_total === 'number' && > 1`).
-    # `index`/`total` are kept as an INTENTIONAL COMPATIBILITY ALIAS so the already
-    # deployed nurix-nlviz proxy, which passes events straight through, keeps working
-    # — no flag-day where one app is redeployed and the other is not. Do not remove
-    # either pair without redeploying both apps.
-    # `sql` rides along so a consumer pinning a chart has the query that produced it.
-    emit({
-        "type": "chart",
-        "html": html,
-        "chart_index": index,
-        "chart_total": total,
-        "index": index,
-        "total": total,
-        "sql": genie_result.get("sql", ""),
-    })
+    # Deliberately does NOT emit the chart event. Indices can only be assigned once
+    # the full set of SUCCESSES is known (see visualizer_node), so emission happens
+    # there. `on_done` reports completion so the caller can keep progress visible
+    # while the remaining charts are still generating.
+    if on_done is not None:
+        on_done()
     return html
 
 
@@ -408,7 +432,9 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
             # Preserve the ORIGINAL full data (never round-tripped through the LLM).
             _, html = _split_chart_data(html)
             html = _insert_head_script(html, data_script)
-        emit({"type": "chart", "html": html, "index": 0, "total": 1})
+        # Built by the shared helper so this path can never again drift out of sync
+        # with the chart-event shape (it previously emitted only index/total).
+        emit(_chart_event(html, index=0, total=1, sql=state.get("existing_sql")))
         return {"chart_htmls": [html]}
 
     if mode == "ask_about_viz":
@@ -426,23 +452,94 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
         emit({"type": "insight", "text": insight})
         return {"insight_text": insight}
 
-    # mode == "chat": parallel chart generation
+    # mode == "chat": parallel chart generation.
+    #
+    # Generation and EMISSION are deliberately separated. Charts used to be emitted
+    # from inside each task as it finished, with `total` fixed to the CANDIDATE count
+    # — so a single generation failure (gather(return_exceptions=True) turns it into a
+    # non-event) left a GAP in the emitted indices while `chart_total` still claimed
+    # the full count. The consumer writes charts into an array by index, so it would
+    # wait forever for a chart that was never coming, and sql/chart pairing desynced.
+    #
+    # Instead: generate everything, keep only the SUCCESSES in their original
+    # relative order, and only THEN assign dense indices 0..N-1 with
+    # chart_total == number of successes. Emission therefore batches at the end;
+    # `on_done` keeps progress visible while generation is still in flight.
     genie_results = state.get("genie_results", [])
     sub_questions = state.get("sub_questions", [])
     chart_hints = state.get("chart_hints", [])
-    total = len(sub_questions)
+    candidate_count = len(sub_questions)
+
+    # Who owns the `sql` event depends on the path. The PLAIN path's genie_node already
+    # emits one per sub-question as it completes (early, useful feedback), so emitting
+    # again here would duplicate it and change that path's event shape. Deep research
+    # deliberately defers its `sql` events to here so their indices match the charts
+    # that actually rendered. Either way the chart event carries its own `sql`, so
+    # sql -> chart pairing never depends on which path emitted the sql event.
+    emit_sql = bool(state.get("deep_research"))
+
+    completed = 0
+
+    def _note_done() -> None:
+        # Perceived-progress heartbeat: charts no longer stream out individually, so
+        # without this the UI would sit silent for the whole generation window.
+        nonlocal completed
+        completed += 1
+        emit({
+            "type": "thinking",
+            "text": f"Rendered chart {completed} of {candidate_count}...",
+        })
 
     tasks = [
-        _generate_chart(sub_questions[i], chart_hints[i] if i < len(chart_hints) else "auto", genie_results[i] if i < len(genie_results) else {}, cfg, i, total, emit, token)
-        for i in range(total)
+        _generate_chart(
+            sub_questions[i],
+            chart_hints[i] if i < len(chart_hints) else "auto",
+            genie_results[i] if i < len(genie_results) else {},
+            cfg, i, token, _note_done,
+        )
+        for i in range(candidate_count)
     ]
-    htmls = await asyncio.gather(*tasks, return_exceptions=True)
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
-    chart_htmls = []
-    for h in htmls:
-        if isinstance(h, Exception):
-            chart_htmls.append(f"<h3>Chart Error</h3><p>{str(h)}</p>")
-        else:
-            chart_htmls.append(h)
+    # Keep successes in ORIGINAL order; a failure is reported, never silently skipped.
+    survivors: list[tuple[int, str]] = []
+    for i, outcome in enumerate(outcomes):
+        if isinstance(outcome, BaseException):
+            label = sub_questions[i] if i < len(sub_questions) else f"chart {i}"
+            emit({
+                "type": "thinking",
+                "text": f"Could not render a chart for '{label[:80]}': "
+                        f"{type(outcome).__name__}: {str(outcome)[:200]}",
+            })
+            continue
+        survivors.append((i, outcome))
+
+    if len(survivors) < candidate_count:
+        emit({
+            "type": "thinking",
+            "text": f"{candidate_count} chart{'s' if candidate_count != 1 else ''} "
+                    f"attempted; {len(survivors)} rendered successfully.",
+        })
+
+    total = len(survivors)
+    chart_htmls: list[str] = []
+    for new_index, (orig_index, html) in enumerate(survivors):
+        result = genie_results[orig_index] if orig_index < len(genie_results) else {}
+        sql = result.get("sql") or ""
+        # Every candidate reaching this point was admitted with a non-empty SQL by
+        # the upstream node, so an empty one here means that contract broke. Say so
+        # rather than shipping a chart whose `sql` silently vanished.
+        if not sql.strip():
+            emit({
+                "type": "thinking",
+                "text": f"Chart {new_index} is missing the SQL that produced it; "
+                        f"it cannot be pinned or refined with its query.",
+            })
+        if emit_sql:
+            # Deferred from the deep-research node so this index matches the chart
+            # that actually rendered, letting a consumer pair sql -> chart.
+            emit({"type": "sql", "sql": sql, "chart_index": new_index, "index": new_index})
+        emit(_chart_event(html, index=new_index, total=total, sql=sql))
+        chart_htmls.append(html)
 
     return {"chart_htmls": chart_htmls}

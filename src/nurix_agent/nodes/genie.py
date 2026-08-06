@@ -26,7 +26,7 @@ def _is_numeric_type(type_text: str | None) -> bool:
     return base in _NUMERIC_TYPES
 
 
-def _has_numeric_column(columns: list) -> bool:
+def _has_numeric_column(columns: list, rows: list | None = None) -> bool:
     """
     Whether a result set carries at least one numeric (measure) column.
 
@@ -40,8 +40,15 @@ def _has_numeric_column(columns: list) -> bool:
 
     A raw, un-normalized `type` is still accepted (delegating to
     `_is_numeric_type`) so the helper is correct wherever it is called from.
+
+    When `rows` is supplied, a column the TYPE says is a string is re-checked
+    against its actual VALUES via `_column_values_are_numeric` (which itself
+    parses through the shared `_coerce`). Genie sometimes types a real measure as
+    STRING, and type metadata alone would throw away a chartable result. Types are
+    still consulted FIRST — values only ever ADD a numeric column, never remove one.
     """
-    for c in columns or []:
+    string_typed: list[int] = []
+    for i, c in enumerate(columns or []):
         if not isinstance(c, dict):
             continue
         type_text = c.get("type")
@@ -49,6 +56,12 @@ def _has_numeric_column(columns: list) -> bool:
             continue
         if type_text.strip().lower() == "number" or _is_numeric_type(type_text):
             return True
+        string_typed.append(i)
+
+    if rows:
+        for i in string_typed:
+            if _column_values_are_numeric(rows, i):
+                return True
     return False
 
 
@@ -63,6 +76,48 @@ def _coerce(value, numeric: bool):
         return int(v)
     except ValueError:
         return value
+
+
+def _column_values_are_numeric(rows: list, col_index: int) -> bool:
+    """
+    Whether a column's actual CELL VALUES are numeric, for a column whose TYPE
+    metadata says string.
+
+    Genie sometimes types a genuine measure as STRING (including pre-formatted
+    values like "42%" or "1,234"), and trusting the type alone would discard a
+    perfectly chartable result. Values are the tie-breaker, not a replacement:
+    this is only consulted after `_is_numeric_type` has already said no.
+
+    Parsing goes through `_coerce` — the SAME coercion the row pipeline uses — so
+    what counts as numeric here cannot drift from what the charts actually receive.
+    A trailing unit suffix (%, currency) is tolerated by retrying the stripped text,
+    since the underlying magnitude is still plottable.
+
+    Conservative by construction: EVERY non-null value must parse, and there must be
+    at least one. One stray label means the column is text, not a measure.
+    """
+    seen = False
+    for row in rows or []:
+        if col_index >= len(row):
+            return False
+        value = row[col_index]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue  # nulls/blanks do not disqualify a measure
+        seen = True
+        if isinstance(value, bool):
+            return False  # a flag is not a measure
+        if isinstance(value, (int, float)):
+            continue
+        if not isinstance(value, str):
+            return False
+        if isinstance(_coerce(value, True), (int, float)):
+            continue
+        # Retry without a single leading/trailing unit marker (%, $, £, €).
+        stripped = value.strip().strip("%").strip("$£€").strip()
+        if stripped and isinstance(_coerce(stripped, True), (int, float)):
+            continue
+        return False
+    return seen
 
 
 def _extract_columns_rows(statement_response) -> tuple[list[dict], list[list]]:

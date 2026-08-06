@@ -142,7 +142,7 @@ async def refine(req: RefineRequest):
         "mode": "refine",
         "deep_research": False,
         "existing_html": req.chart_html,
-        "existing_sql": None,
+        "existing_sql": req.sql,
         "refine_instruction": req.instruction,
         "is_relevant": False,
         "rejection_reason": None,

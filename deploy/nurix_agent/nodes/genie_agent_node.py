@@ -39,6 +39,15 @@ def _recon_skip_reason(sq: dict) -> str | None:
     rows = sq.get("rows") or []
     columns = sq.get("columns") or []
 
+    # A chart with no query behind it cannot be pinned, refined or explained, and the
+    # chart event's `sql` contract would be met only by an empty string pretending to
+    # be a query. genie_agent.py admits a complete-metadata result whose `sql` is ""
+    # (the `_sqlless_metadata` capture, which deliberately still REPORTS such results
+    # upstream); those results are reported there and skipped here rather than charted
+    # with a fabricated empty query.
+    if not (sq.get("sql") or "").strip():
+        return "arrived without the SQL that produced it, so it cannot be charted"
+
     # (b) Nothing to plot at all.
     if not rows:
         return "returned no rows"
@@ -46,8 +55,9 @@ def _recon_skip_reason(sq: dict) -> str | None:
     # already states such a figure, so a one-value chart adds nothing.
     if len(rows) <= 1:
         return "returned a single row (a scalar probe, not a chart)"
-    # (c) No measure column means there is no value axis to plot against.
-    if not _has_numeric_column(columns):
+    # (c) No measure column means there is no value axis to plot against. Rows are
+    # passed so a measure Genie mistyped as STRING is still recognised by its values.
+    if not _has_numeric_column(columns, rows):
         col_names = ", ".join(
             str(c.get("name", "")) for c in columns if isinstance(c, dict)
         )
@@ -129,28 +139,40 @@ async def genie_agent_node(state: AgentState, config: RunnableConfig) -> dict:
             "text": f"Skipped charting '{_label(sq)}' — {reason}.",
         })
 
-    if dropped and chartable:
-        emit({
-            "type": "thinking",
-            "text": f"{len(sub_queries)} sub-queries ran; charting {len(chartable)} "
-                    f"({len(dropped)} skipped as low-value scouting queries).",
-        })
-
     # Filtering must never turn a run that HAD data into a silent empty response.
-    # Fall back to the best available result (most rows) and say so.
+    # Fall back to the best available result (most rows) and say so. Results that
+    # arrived WITHOUT their SQL are not eligible: charting one would reintroduce the
+    # empty-`sql` chart this filter exists to prevent. They were already reported
+    # individually above.
     if not chartable and dropped:
-        best, best_reason = max(dropped, key=lambda d: len(d[0].get("rows") or []))
-        chartable = [best]
+        eligible = [d for d in dropped if (d[0].get("sql") or "").strip()]
+        if eligible:
+            best, best_reason = max(eligible, key=lambda d: len(d[0].get("rows") or []))
+            chartable = [best]
+            emit({
+                "type": "thinking",
+                "text": f"Every sub-query looked like a low-value scouting query, so nothing "
+                        f"would have been charted. Charting the best available result "
+                        f"('{_label(best)}', which {best_reason}) rather than returning nothing.",
+            })
+
+    # The derived N-ran / M-charted / K-skipped summary. Emitted whenever anything was
+    # skipped — INCLUDING after the fallback above, where the user would otherwise get
+    # individual notices and fallback prose but no arithmetic tying them together.
+    # Counts are always derived from the real lists, never hardcoded.
+    if dropped:
+        charted = len(chartable)
+        skipped = len(sub_queries) - charted
         emit({
             "type": "thinking",
-            "text": f"Every sub-query looked like a low-value scouting query, so nothing "
-                    f"would have been charted. Charting the best available result "
-                    f"('{_label(best)}', which {best_reason}) rather than returning nothing.",
+            "text": f"{len(sub_queries)} sub-quer"
+                    f"{'y' if len(sub_queries) == 1 else 'ies'} ran; charting {charted} "
+                    f"({skipped} skipped as low-value scouting queries).",
         })
 
     sub_questions: list[str] = []
     genie_results: list[dict] = []
-    for i, sq in enumerate(chartable):
+    for sq in chartable:
         # Genie's own step title is the best chart heading; fall back to the question.
         sub_questions.append(sq.get("title") or question)
         genie_results.append({
@@ -159,10 +181,10 @@ async def genie_agent_node(state: AgentState, config: RunnableConfig) -> dict:
             "columns": sq["columns"],
             "rows": sq["rows"],
         })
-        # `chart_index` pairs this SQL with the chart event carrying the same value;
-        # `index` is the pre-existing key, kept as a compatibility alias (see the
-        # chart event in nodes/visualizer.py).
-        emit({"type": "sql", "sql": sq.get("sql", ""), "chart_index": i, "index": i})
+
+    # The `sql` events are emitted by the visualizer AFTER chart generation, so their
+    # indices match the charts that actually rendered. Emitting them here would
+    # promise a chart for every candidate, including ones whose generation later fails.
 
     if not chartable:
         emit({"type": "thinking", "text": "No chartable result sets were recovered."})
