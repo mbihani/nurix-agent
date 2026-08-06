@@ -12,6 +12,7 @@ from langchain_core.runnables import RunnableConfig
 
 from ..config import AppConfig
 from ..genie_agent import run_agent_mode
+from ..narrative import clean_genie_narrative
 from ..state import AgentState
 
 # Genie picks its own chart-worthy result sets, so there is no per-sub-question hint
@@ -48,7 +49,11 @@ async def genie_agent_node(state: AgentState, config: RunnableConfig) -> dict:
     # The narrative is the research answer — emit it before the charts so the user
     # reads the conclusion first.
     if result.get("text"):
-        emit({"type": "genie_text", "text": result["text"], "index": 0})
+        emit({
+            "type": "genie_text",
+            "text": clean_genie_narrative(result["text"]),
+            "index": 0,
+        })
 
     # Only sub-queries that actually carry data can be charted.
     chartable = [
