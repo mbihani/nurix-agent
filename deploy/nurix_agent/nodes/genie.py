@@ -26,6 +26,32 @@ def _is_numeric_type(type_text: str | None) -> bool:
     return base in _NUMERIC_TYPES
 
 
+def _has_numeric_column(columns: list) -> bool:
+    """
+    Whether a result set carries at least one numeric (measure) column.
+
+    Lives next to `_is_numeric_type` so numeric detection has exactly ONE home.
+    Callers see columns AFTER `_extract_columns_rows` / `_columns_from_metadata`
+    have folded the raw Databricks type through `_is_numeric_type` into the
+    normalized {"name", "type": "number"|"string"} shape, so the normalized
+    marker is what we read. Re-running `_is_numeric_type("number")` here would
+    return False ("NUMBER" is not a Databricks type name) — the exact kind of
+    second, inconsistent implementation this helper exists to prevent.
+
+    A raw, un-normalized `type` is still accepted (delegating to
+    `_is_numeric_type`) so the helper is correct wherever it is called from.
+    """
+    for c in columns or []:
+        if not isinstance(c, dict):
+            continue
+        type_text = c.get("type")
+        if not isinstance(type_text, str):
+            continue
+        if type_text.strip().lower() == "number" or _is_numeric_type(type_text):
+            return True
+    return False
+
+
 def _coerce(value, numeric: bool):
     """Cast numeric-column string cells to int/float; leave everything else as-is."""
     if value is None or not numeric or not isinstance(value, str):

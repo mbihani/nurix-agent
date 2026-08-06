@@ -366,7 +366,22 @@ async def _generate_chart(sub_question: str, chart_hint: str, genie_result: dict
         html = _inject_chart_data(html, {"columns": columns, "rows": rows})
         span.set_outputs({"html_length": len(html), "row_count": len(rows)})
 
-    emit({"type": "chart", "html": html, "index": index, "total": total})
+    # `chart_index`/`chart_total` are the names the nurix-nlviz consumer reads
+    # (its multi-chart branch is `typeof event.chart_total === 'number' && > 1`).
+    # `index`/`total` are kept as an INTENTIONAL COMPATIBILITY ALIAS so the already
+    # deployed nurix-nlviz proxy, which passes events straight through, keeps working
+    # — no flag-day where one app is redeployed and the other is not. Do not remove
+    # either pair without redeploying both apps.
+    # `sql` rides along so a consumer pinning a chart has the query that produced it.
+    emit({
+        "type": "chart",
+        "html": html,
+        "chart_index": index,
+        "chart_total": total,
+        "index": index,
+        "total": total,
+        "sql": genie_result.get("sql", ""),
+    })
     return html
 
 
