@@ -7,6 +7,7 @@ from databricks.sdk.service.dashboards import GenieMessage, MessageStatus
 from langchain_core.runnables import RunnableConfig
 
 from ..config import AppConfig
+from ..narrative import clean_genie_narrative
 from ..state import AgentState
 
 # Bound the whole Genie conversation (start + internal poll + result fetch) for a
@@ -372,7 +373,11 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, em
         emit({"type": "thinking", "text": f"Genie query failed: {result.get('text', '')[:200]}", "index": index})
     else:
         if result.get("text"):
-            emit({"type": "genie_text", "text": result["text"], "index": index})
+            emit({
+                "type": "genie_text",
+                "text": clean_genie_narrative(result["text"]),
+                "index": index,
+            })
         if result.get("sql"):
             emit({"type": "sql", "sql": result["sql"], "index": index})
         # Narrative/SQL may have been extracted fine while the tabular result
