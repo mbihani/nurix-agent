@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import re
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.dashboards import GenieMessage, MessageStatus
@@ -26,6 +27,127 @@ def _is_numeric_type(type_text: str | None) -> bool:
     return base in _NUMERIC_TYPES
 
 
+# Column-name tokens that indicate a MEASURE (something worth plotting on a value
+# axis). Used only to rescue a column the type metadata mislabelled as STRING.
+_MEASURE_NAME_TOKENS = frozenset({
+    "count", "total", "sum", "amount", "rate", "score", "avg", "average",
+    "pct", "percent", "percentage", "ratio", "revenue", "price", "cost",
+    "qty", "quantity", "num", "n", "median", "min", "max", "delta", "change",
+    "growth",
+})
+
+# Column-name tokens that indicate an IDENTIFIER or a calendar part — digits that
+# are a LABEL, not a magnitude. "2023" and "560001" parse as numbers but plotting
+# them on a value axis is nonsense, which is precisely the low-value chart the recon
+# filter exists to remove. This guard WINS over measure-name evidence, so
+# "order_number" is rejected despite the measure-ish "number"/"num" token.
+_IDENTIFIER_NAME_TOKENS = frozenset({
+    "id", "ids", "code", "codes", "zip", "zipcode", "postal", "postcode",
+    "phone", "telephone", "mobile", "fax", "year", "yr", "month", "day",
+    "date", "datetime", "timestamp", "week", "quarter", "uuid", "guid",
+    "key", "number", "no", "account", "ssn", "sku", "isbn", "ein", "vat",
+})
+
+# Thousands separators / percent / currency in the RAW string. This is the
+# formatting evidence that a string column was rendered as a MEASURE: a bare digit
+# run like "2023" carries no such marker and is deliberately not matched.
+_MEASURE_FORMAT_RE = re.compile(r"[%$£€¥]|\d,\d{3}(?:\D|$)")
+
+
+def _name_tokens(name: str) -> set[str]:
+    """Lowercase word tokens of a column name, splitting on non-alphanumerics."""
+    return {t for t in re.split(r"[^a-z0-9]+", (name or "").lower()) if t}
+
+
+def _looks_like_identifier_name(name: str) -> bool:
+    """True if the column name marks it as an identifier or a calendar part."""
+    return bool(_name_tokens(name) & _IDENTIFIER_NAME_TOKENS)
+
+
+def _looks_like_measure_name(name: str) -> bool:
+    """
+    True if the column name marks it as a measure.
+
+    Also matches the `n_`/`_n` prefix/suffix convention for counts, which
+    tokenizes to a bare "n".
+    """
+    return bool(_name_tokens(name) & _MEASURE_NAME_TOKENS)
+
+
+def _has_measure_formatting(rows: list, col_index: int) -> bool:
+    """
+    True if any raw string value carries measure FORMATTING (%, currency, 1,234).
+
+    Deliberately checked on the RAW text, before `_coerce` strips separators: the
+    formatting is the evidence, and coercion would erase it.
+    """
+    for row in rows or []:
+        if col_index >= len(row):
+            continue
+        value = row[col_index]
+        if isinstance(value, str) and _MEASURE_FORMAT_RE.search(value):
+            return True
+    return False
+
+
+def _has_numeric_column(columns: list, rows: list | None = None) -> bool:
+    """
+    Whether a result set carries at least one numeric (measure) column.
+
+    Lives next to `_is_numeric_type` so numeric detection has exactly ONE home.
+    Callers see columns AFTER `_extract_columns_rows` / `_columns_from_metadata`
+    have folded the raw Databricks type through `_is_numeric_type` into the
+    normalized {"name", "type": "number"|"string"} shape, so the normalized
+    marker is what we read. Re-running `_is_numeric_type("number")` here would
+    return False ("NUMBER" is not a Databricks type name) — the exact kind of
+    second, inconsistent implementation this helper exists to prevent.
+
+    A raw, un-normalized `type` is still accepted (delegating to
+    `_is_numeric_type`) so the helper is correct wherever it is called from.
+
+    When `rows` is supplied, a column the TYPE says is a string may be RESCUED as a
+    measure — Genie sometimes types a real measure as STRING, and type metadata alone
+    would throw away a chartable result. Types are still consulted FIRST, and value
+    sniffing only ever ADDS a numeric column, never removes one.
+
+    The rescue demands STRONG measure evidence, because "every value parses as a
+    number" is a statement about STORAGE REPRESENTATION, not measure SEMANTICS:
+    customer ids, years, and ZIP codes all parse, and charting them on a value axis
+    is exactly the nonsense the recon filter exists to remove. So a rescue needs
+    values that all parse AND at least one of:
+
+      1. FORMATTING evidence — %, a currency symbol, or thousands separators in the
+         raw text ("42%", "$12.50", "1,234"). A bare digit run is NOT evidence.
+      2. NAME evidence — a measure-ish token (count, total, rate, pct, ...).
+
+    An identifier-ish name (id, zip, year, phone, order_number, ...) VETOES the
+    rescue outright, outranking name evidence — that is what keeps "order_number"
+    and "year" out despite their measure-ish tokens.
+    """
+    string_typed: list[int] = []
+    for i, c in enumerate(columns or []):
+        if not isinstance(c, dict):
+            continue
+        type_text = c.get("type")
+        if not isinstance(type_text, str):
+            continue
+        if type_text.strip().lower() == "number" or _is_numeric_type(type_text):
+            return True
+        string_typed.append(i)
+
+    if rows:
+        for i in string_typed:
+            name = columns[i].get("name", "") if isinstance(columns[i], dict) else ""
+            # The identifier veto is checked FIRST and wins over name evidence.
+            if _looks_like_identifier_name(name):
+                continue
+            if not (_has_measure_formatting(rows, i) or _looks_like_measure_name(name)):
+                continue
+            if _column_values_are_numeric(rows, i):
+                return True
+    return False
+
+
 def _coerce(value, numeric: bool):
     """Cast numeric-column string cells to int/float; leave everything else as-is."""
     if value is None or not numeric or not isinstance(value, str):
@@ -37,6 +159,47 @@ def _coerce(value, numeric: bool):
         return int(v)
     except ValueError:
         return value
+
+
+def _column_values_are_numeric(rows: list, col_index: int) -> bool:
+    """
+    Whether a column's actual CELL VALUES all parse as numbers.
+
+    PARSEABILITY ONLY — this says nothing about whether the column is a measure.
+    Ids, years and ZIP codes all pass. `_has_numeric_column` therefore requires
+    separate measure evidence (formatting or name) and applies an identifier veto
+    before consulting this; do not use it alone as a chartability test.
+
+    Parsing goes through `_coerce` — the SAME coercion the row pipeline uses — so
+    what counts as numeric here cannot drift from what the charts actually receive.
+    A trailing unit suffix (%, currency) is tolerated by retrying the stripped text,
+    since the underlying magnitude is still plottable.
+
+    Conservative by construction: EVERY non-null value must parse, and there must be
+    at least one. One stray label means the column is text, not a measure.
+    """
+    seen = False
+    for row in rows or []:
+        if col_index >= len(row):
+            return False
+        value = row[col_index]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue  # nulls/blanks do not disqualify a measure
+        seen = True
+        if isinstance(value, bool):
+            return False  # a flag is not a measure
+        if isinstance(value, (int, float)):
+            continue
+        if not isinstance(value, str):
+            return False
+        if isinstance(_coerce(value, True), (int, float)):
+            continue
+        # Retry without a single leading/trailing unit marker (%, $, £, €).
+        stripped = value.strip().strip("%").strip("$£€").strip()
+        if stripped and isinstance(_coerce(stripped, True), (int, float)):
+            continue
+        return False
+    return seen
 
 
 def _extract_columns_rows(statement_response) -> tuple[list[dict], list[list]]:
