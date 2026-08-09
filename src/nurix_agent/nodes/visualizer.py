@@ -56,11 +56,15 @@ VISUALIZATION_GUIDE = (
     "    options.plugins.legend.labels.color = '#94A3B8'\n"
     "    options.scales.x.ticks.color        = '#94A3B8'\n"
     "    options.scales.y.ticks.color        = '#94A3B8'\n"
-    "    options.scales.x.grid.color         = '#1E293B'\n"
-    "    options.scales.y.grid.color         = '#1E293B'\n"
+    "    options.scales.x.grid.color         = '#111A2B'\n"
+    "    options.scales.y.grid.color         = '#111A2B'\n"
+    "    options.scales.x.grid.borderColor   = '#111A2B'\n"
+    "    options.scales.y.grid.borderColor   = '#111A2B'\n"
+    "    options.scales.x.border.color       = '#111A2B'\n"
+    "    options.scales.y.border.color       = '#111A2B'\n"
     "    options.scales.x.title.color        = '#94A3B8'   (whenever an axis title shows)\n"
     "    options.scales.y.title.color        = '#94A3B8'\n"
-    "- Gridlines: #1E293B, thin (lineWidth 1).\n"
+    "- Gridlines, tick lines, and scale borders: #111A2B, thin (lineWidth 1).\n"
     "- Every other piece of in-chart text (axis titles, data labels, annotations,\n"
     "  tooltips): #94A3B8. ONLY the single headline number of a KPI/counter may be #FFFFFF.\n"
     "- TABLES are a legitimate output and must ALSO be dark: table/cell background\n"
@@ -71,6 +75,12 @@ VISUALIZATION_GUIDE = (
     "  its card with no overflow. Do NOT set maintainAspectRatio: true.\n"
     "- Do NOT set a fixed pixel width or height on the canvas, and do NOT put a\n"
     "  height= or width= attribute on the <canvas> element.\n"
+    "- For doughnut/pie charts, keep the arc centred and vertically balanced under\n"
+    "  maintainAspectRatio: false: set options.plugins.legend.position = 'bottom',\n"
+    "  options.plugins.legend.align = 'center', options.plugins.legend.fullSize = false,\n"
+    "  options.plugins.legend.maxHeight = 32, and options.layout.padding =\n"
+    "  {top: 40, right: 8, bottom: 8, left: 8}. The extra 32px of top padding\n"
+    "  counterbalances the bounded bottom legend; equal side padding centres the arc.\n"
     "\nSORTING:\n"
     "- Questions with 'top', 'most', 'highest', 'largest', 'best' → sort descending by metric\n"
     "- Time series → always sort chronologically ascending\n"
@@ -88,7 +98,7 @@ VISUALIZATION_GUIDE = (
     "- Chart fills full width, height 100%\n"
     "- Use ONLY the 7-color categorical ramp above for series, in that order\n"
     "- Apply the dark theme rules above in full: body #020617, transparent canvas,\n"
-    "  #94A3B8 tick/legend/title text, #1E293B gridlines\n"
+    "  #94A3B8 tick/legend/title text, #111A2B gridlines/scale borders\n"
     "- NO explanatory text, NO markdown fences, just raw HTML starting with <!DOCTYPE html>\n"
 )
 
@@ -122,10 +132,17 @@ Generate a SINGLE self-contained HTML file with:
 - Series palette — ONLY these 7, in this order, no blue, no substitutions:
   [#0891B2, #d95926, #199e70, #c98500, #d55181, #9085e9, #e66767]
 - DARK THEME IS REQUIRED: body background #020617, transparent chart canvas,
-  legend/tick/axis-title text #94A3B8, gridlines #1E293B. Set
+  legend/tick/axis-title text #94A3B8, gridlines/scale borders #111A2B. Set
   options.plugins.legend.labels.color, options.scales.*.ticks.color and
-  options.scales.*.grid.color EXPLICITLY — Chart.js defaults render dark-on-light
+  options.scales.x.grid.color, options.scales.y.grid.color,
+  options.scales.x.grid.borderColor, options.scales.y.grid.borderColor,
+  options.scales.x.border.color, and options.scales.y.border.color EXPLICITLY —
+  Chart.js defaults render dark-on-light
   and would produce a white chart on the dark dashboard.
+- For doughnut/pie charts under the client's forced maintainAspectRatio: false,
+  set options.plugins.legend.position = 'bottom', align = 'center', fullSize = false,
+  maxHeight = 32, and options.layout.padding = {top: 40, right: 8, bottom: 8, left: 8}.
+  This keeps the arc horizontally centred and counterbalances the bottom legend.
 - Do NOT use #0F172A anywhere: it is the OLD card color and no longer matches the
   dashboard. The surface is #020617.
 - Tables must be dark too: background #020617, text #E2E8F0, header text #94A3B8,
@@ -147,14 +164,20 @@ DATA SOURCE — CRITICAL:
 DARK THEME — PRESERVE IT:
 - The chart lives in a dark dashboard card. Keep the dark theme intact unless the
   instruction explicitly asks to change colors: body background #020617, transparent
-  chart canvas, legend/tick/axis-title text #94A3B8, gridlines #1E293B, tables on
+  chart canvas, legend/tick/axis-title text #94A3B8, gridlines/scale borders #111A2B, tables on
   #020617 with #E2E8F0 text. Never return a chart with a white/light background.
 - Do NOT use #0F172A: it is the OLD card color and no longer matches the dashboard.
   If the HTML you are given still paints #0F172A, REPLACE it with #020617.
 - Series colors come ONLY from [#0891B2, #d95926, #199e70, #c98500, #d55181,
   #9085e9, #e66767]. There is deliberately no blue — never introduce one.
-- Keep options.plugins.legend.labels.color, options.scales.*.ticks.color and
-  options.scales.*.grid.color set; dropping them makes Chart.js render light again.
+- Keep options.plugins.legend.labels.color, options.scales.*.ticks.color,
+  options.scales.x.grid.color, options.scales.y.grid.color,
+  options.scales.x.grid.borderColor, options.scales.y.grid.borderColor,
+  options.scales.x.border.color, and options.scales.y.border.color set to the colors
+  above; dropping them makes Chart.js render light again.
+- For doughnut/pie charts, preserve bottom-centred legend settings (position = 'bottom',
+  align = 'center', fullSize = false, maxHeight = 32) and options.layout.padding =
+  {top: 40, right: 8, bottom: 8, left: 8}; never set maintainAspectRatio: true.
 
 Do NOT add narrative paragraphs. Return ONLY the complete HTML, no markdown.
 """
