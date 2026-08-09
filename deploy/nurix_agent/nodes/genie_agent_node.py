@@ -126,7 +126,36 @@ async def genie_agent_node(state: AgentState, config: RunnableConfig) -> dict:
 
     # The narrative is the research answer — emit it before the charts so the user
     # reads the conclusion first.
+    #
+    # STREAMING NOTE (verified against the live surface, 2026-08-10): Genie's agents
+    # SSE stream does NOT emit incremental text deltas for this narrative. The final
+    # `message` item arrives on `response.output_item.added` ALREADY
+    # `status=completed`, carrying the entire narrative in one frame (measured: 1270
+    # chars landing in a single frame at +20.3s), and `.done` repeats it
+    # byte-identically. There is no `response.output_text.delta`-style event on this
+    # surface at all — the only event names are response.created,
+    # response.output_item.added/.done and response.completed.
+    #
+    # So `genie_text_delta` is emitted from whatever granularity Genie actually gives
+    # us — in practice ONE delta per narrative part. We deliberately do NOT chop the
+    # completed string into artificial chunks: that would add no latency benefit and
+    # would misrepresent a non-streaming platform as streaming. When Genie does start
+    # emitting deltas, they will flow through unchanged.
     if result.get("text"):
+        for piece in result.get("text_parts") or [result["text"]]:
+            if piece and piece.strip():
+                # RAW text (citations NOT yet stripped) — the terminal genie_text
+                # below is authoritative; see the contract comment there.
+                emit({"type": "genie_text_delta", "text": piece, "index": 0})
+        # TERMINAL, authoritative event — unchanged in shape, still passed through
+        # clean_genie_narrative() for citation stripping.
+        #
+        # CLIENT CONTRACT: the `genie_text_delta` events above are RAW Genie output and
+        # may still contain citation links. This terminal `genie_text` carries the
+        # CLEANED text and is the authoritative version, so a client that renders
+        # deltas progressively must REPLACE its accumulated delta text with this
+        # payload, not append to it. A client that ignores `genie_text_delta`
+        # entirely behaves exactly as it did before streaming was added.
         emit({
             "type": "genie_text",
             "text": clean_genie_narrative(result["text"]),

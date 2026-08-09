@@ -14,4 +14,6 @@ env:
   - name: CLAUDE_MODEL
     value: databricks-claude-sonnet-5
   - name: MLFLOW_EXPERIMENT
-    value: nurix-agent-traces
+    value: /Shared/nurix-agent-traces
+  - name: MLFLOW_TRACKING_URI
+    value: databricks

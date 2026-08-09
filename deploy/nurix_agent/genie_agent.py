@@ -16,6 +16,23 @@ captured while the stream is open. That is why every drop path in this module is
 counted and surfaced through `emit` instead of being swallowed: a frame we fail to
 understand is data the user can never get back, so it has to be visible.
 
+No incremental TEXT deltas (platform limitation)
+------------------------------------------------
+Reasoning frames DO arrive progressively (measured landing at +8.6s ... +40.8s), which
+is what makes the `thinking` events genuinely incremental. The final NARRATIVE does
+not: the `message` item arrives on `response.output_item.added` ALREADY
+`status=completed` with the entire text in one frame (live probe 2026-08-10: 1270
+chars in a single frame at +20.3s), and `.done` repeats it byte-identically. This
+surface emits no `response.output_text.delta`-style event — the complete observed
+event set is response.created, response.output_item.added/.updated/.done,
+response.completed and response.failed.
+
+Consequence: `genie_text_delta` can only be emitted at Genie's own content-PART
+granularity (see `narrative_parts`). Chopping the finished narrative into synthetic
+chunks is deliberately NOT done — it would add no latency benefit and would present a
+non-streaming platform as streaming. If Genie later adds text deltas, they will flow
+through this path unchanged.
+
 The databricks-sdk does not expose this endpoint (no `genie/agents` in the SDK tree),
 so the request is hand-rolled with httpx. The bearer token still comes from the SDK
 auth chain (`WorkspaceClient.config.authenticate()`) so agent mode runs as the local
@@ -597,6 +614,24 @@ class AgentStreamAccumulator:
         parts = self._narrative_parts or self._all_parts
         return "\n\n".join(p.strip() for p in parts if p.strip())
 
+    def narrative_parts(self) -> list[str]:
+        """
+        The narrative split at Genie's OWN part boundaries, for progressive emission.
+
+        These are the real content parts of the final `message` item, not arbitrary
+        slices of a finished string — this surface emits no text deltas (see
+        `run_agent_mode`'s docstring), so part boundaries are the finest genuine
+        granularity available.
+
+        Concatenating the returned pieces reproduces `narrative()` exactly, so a client
+        that accumulates them ends up with the same text it would have received in one
+        piece (modulo the citation stripping the caller applies to the terminal event).
+        """
+        parts = [p.strip() for p in (self._narrative_parts or self._all_parts) if p.strip()]
+        # Carry the joining separator on the pieces themselves so naive concatenation
+        # matches narrative() rather than running paragraphs together.
+        return [p if i == 0 else "\n\n" + p for i, p in enumerate(parts)]
+
     def subqueries(self) -> list[dict]:
         """
         Distinct sub-queries in first-seen order, each resolved against the message
@@ -921,6 +956,9 @@ def _build_result(acc: AgentStreamAccumulator, subqueries: list[dict]) -> dict:
     featured = next((e for e in subqueries if e["rows"]), None) or {}
     return {
         "text": acc.narrative(),
+        # Genie's own part boundaries, for progressive `genie_text_delta` emission.
+        # Concatenating these reproduces `text` exactly.
+        "text_parts": acc.narrative_parts(),
         "sql": featured.get("sql", ""),
         "columns": featured.get("columns", []),
         "rows": featured.get("rows", []),

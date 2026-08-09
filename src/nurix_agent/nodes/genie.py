@@ -2,10 +2,12 @@ import asyncio
 import datetime
 import re
 
+import mlflow
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.dashboards import GenieMessage, MessageStatus
 from langchain_core.runnables import RunnableConfig
 
+from .. import tracing
 from ..config import AppConfig
 from ..narrative import clean_genie_narrative
 from ..state import AgentState
@@ -356,18 +358,42 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, em
     """Query the space-scoped Genie Conversation API for a single sub-question."""
     emit({"type": "thinking", "text": f"Querying Genie for: {question[:60]}...", "index": index})
 
-    # SDK Genie calls are blocking (they poll); run in a thread so parallel
-    # sub-questions actually run concurrently and the SSE loop stays responsive.
-    # Catch SDK errors here (e.g. the space's warehouse denying the caller) so
-    # the real cause reaches the client as a clean event instead of surfacing
-    # as an empty "no data" chart or an abrupt disconnect.
-    try:
-        result = await asyncio.to_thread(
-            _run_genie_conversation, cfg.genie_space_id, cfg.databricks_host, question
-        )
-    except Exception as e:
-        emit({"type": "thinking", "text": f"Genie query failed: {str(e)[:200]}", "index": index})
-        return {"text": "", "sql": "", "columns": [], "rows": []}
+    # This PLAIN path previously had no span at all, so a slow or failing Genie
+    # conversation was invisible in a trace while deep research was fully covered.
+    # The span records the sub-question, the SQL Genie produced, and row/column
+    # COUNTS — never row data or full verbatim text (customer feedback).
+    with mlflow.start_span(name=f"genie_{index}") as span:
+        span.set_inputs({
+            "sub_question": tracing.truncate(question),
+            "index": index,
+            "space_id": cfg.genie_space_id,
+        })
+
+        # SDK Genie calls are blocking (they poll); run in a thread so parallel
+        # sub-questions actually run concurrently and the SSE loop stays responsive.
+        # Catch SDK errors here (e.g. the space's warehouse denying the caller) so
+        # the real cause reaches the client as a clean event instead of surfacing
+        # as an empty "no data" chart or an abrupt disconnect.
+        try:
+            result = await asyncio.to_thread(
+                _run_genie_conversation, cfg.genie_space_id, cfg.databricks_host, question
+            )
+        except Exception as e:
+            emit({"type": "thinking", "text": f"Genie query failed: {str(e)[:200]}", "index": index})
+            span.set_outputs({"error": tracing.truncate(str(e)), "row_count": 0, "column_count": 0})
+            return {"text": "", "sql": "", "columns": [], "rows": []}
+
+        columns = result.get("columns") or []
+        rows = result.get("rows") or []
+        span.set_outputs({
+            "sql": result.get("sql") or "",
+            "row_count": len(rows),
+            "column_count": len(columns),
+            "columns": tracing.column_names(columns),
+            "narrative_chars": len(result.get("text") or ""),
+            "failed": bool(result.get("failed")),
+            "result_error": tracing.truncate(result.get("result_error")) or None,
+        })
 
     if result.get("failed"):
         emit({"type": "thinking", "text": f"Genie query failed: {result.get('text', '')[:200]}", "index": index})

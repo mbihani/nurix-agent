@@ -20,7 +20,14 @@ class AppConfig(BaseSettings):
     warehouse_id: str = Field(default="24b0352e1b0dca66", validation_alias="WAREHOUSE_ID")
     ai_gateway_url: str = Field(default="https://7474660648944264.ai-gateway.cloud.databricks.com/mlflow/v1", validation_alias="AI_GATEWAY_URL")
     claude_model: str = Field(default="databricks-claude-sonnet-5", validation_alias="CLAUDE_MODEL")
-    mlflow_experiment: str = Field(default="nurix-agent-traces", validation_alias="MLFLOW_EXPERIMENT")
+    # MUST be an ABSOLUTE workspace path. Databricks rejects a bare experiment name,
+    # and a bare name silently sent every trace to a local ./mlruns directory on the
+    # app container's ephemeral disk — invisible to the user and gone on restart.
+    mlflow_experiment: str = Field(default="/Shared/nurix-agent-traces", validation_alias="MLFLOW_EXPERIMENT")
+    # Without this set, MLflow defaults to a LOCAL ./mlruns directory. Set to
+    # "databricks" so traces land in the workspace; set to "" (or "none"/"off") to
+    # turn tracing off for a local run.
+    mlflow_tracking_uri: str = Field(default="databricks", validation_alias="MLFLOW_TRACKING_URI")
 
 
 def get_databricks_token(cfg: 'AppConfig') -> str:

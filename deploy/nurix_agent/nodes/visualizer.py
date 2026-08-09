@@ -5,6 +5,7 @@ from html.parser import HTMLParser
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 import mlflow
+from .. import tracing
 from ..config import AppConfig, get_databricks_token
 from ..state import AgentState
 
@@ -418,6 +419,62 @@ def _strip_fences(content) -> str:
     return html.strip()
 
 
+def _chunk_text(content) -> str:
+    """
+    Flatten one streamed chunk's `content` into plain text.
+
+    A chunk carries either a string or a list of content blocks (the same two shapes
+    the non-streaming paths already normalize). Blocks are joined WITHOUT a separator,
+    unlike the whitespace-joining done for complete responses: these are consecutive
+    fragments of one sentence, so inserting spaces between them would corrupt the text
+    as it streams.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if isinstance(b, dict):
+                # Ignore non-text blocks (e.g. reasoning/tool blocks) — only the
+                # visible answer text belongs in a delta.
+                if b.get("type") in (None, "text") and isinstance(b.get("text"), str):
+                    out.append(b["text"])
+            elif isinstance(b, str):
+                out.append(b)
+        return "".join(out)
+    return str(content)
+
+
+async def _stream_text_deltas(llm, messages, on_delta) -> str:
+    """
+    Stream an LLM response, invoking `on_delta` per non-empty text fragment, and
+    return the COMPLETE accumulated text.
+
+    THE EVENT CONTRACT (matters to the frontend):
+      * Progressive fragments go out as an ADDITIVE new event type; the terminal
+        event carrying the full text is still emitted by the caller, unchanged.
+      * A client that ignores the delta events therefore sees byte-identical
+        behaviour to before streaming existed. There is no flag day.
+      * Deltas are RAW model output. The caller may post-process the complete text
+        (e.g. citation stripping), so the TERMINAL event is AUTHORITATIVE and a
+        client rendering deltas is expected to REPLACE its accumulated text with the
+        terminal payload rather than append to it.
+
+    Accumulating here (rather than trusting the caller to concatenate deltas) keeps
+    the returned text the single source of truth for the terminal event.
+    """
+    parts: list[str] = []
+    async for chunk in llm.astream(messages):
+        piece = _chunk_text(getattr(chunk, "content", None))
+        if not piece:
+            continue
+        parts.append(piece)
+        on_delta(piece)
+    return "".join(parts)
+
+
 def _chart_event(html: str, *, index: int, total: int, sql: str | None) -> dict:
     """
     Build THE chart SSE event — the single construction site for every emitter.
@@ -508,16 +565,24 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
         # never has to re-type (and thus truncate) the data; re-inject it afterward.
         existing_html = state["existing_html"] or ""
         data_script, scaffold = _split_chart_data(existing_html)
-        async with asyncio.timeout(30):
-            response = await llm.ainvoke([
-                {"role": "system", "content": REFINE_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Instruction: {state['refine_instruction']}\n\nExisting HTML:\n{scaffold}"},
-            ])
-        html = _strip_fences(response.content)
-        if data_script is not None:
-            # Preserve the ORIGINAL full data (never round-tripped through the LLM).
-            _, html = _split_chart_data(html)
-            html = _insert_head_script(html, data_script)
+        # This branch made an LLM call with no span; only the chat path was traced.
+        with mlflow.start_span(name="visualizer_refine") as span:
+            span.set_inputs({
+                "instruction": tracing.truncate(state["refine_instruction"]),
+                "scaffold_chars": len(scaffold),
+                "had_data_script": data_script is not None,
+            })
+            async with asyncio.timeout(30):
+                response = await llm.ainvoke([
+                    {"role": "system", "content": REFINE_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Instruction: {state['refine_instruction']}\n\nExisting HTML:\n{scaffold}"},
+                ])
+            html = _strip_fences(response.content)
+            if data_script is not None:
+                # Preserve the ORIGINAL full data (never round-tripped through the LLM).
+                _, html = _split_chart_data(html)
+                html = _insert_head_script(html, data_script)
+            span.set_outputs({"html_length": len(html), "data_preserved": data_script is not None})
         # Built by the shared helper so this path can never again drift out of sync
         # with the chart-event shape (it previously emitted only index/total).
         emit(_chart_event(html, index=0, total=1, sql=state.get("existing_sql")))
@@ -526,15 +591,39 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
     if mode == "ask_about_viz":
         llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key=token, model=cfg.claude_model)
         user_msg = f"Question: {state['question']}\n\nSQL: {state.get('existing_sql', '')}\n\nChart HTML (contains data):\n{state['existing_html'][:3000]}"
-        async with asyncio.timeout(30):
-            response = await llm.ainvoke([
-                {"role": "system", "content": INSIGHT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ])
-        content = response.content
-        if isinstance(content, list):
-            content = " ".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
-        insight = content.strip()
+        # This branch made an LLM call with no span. It also blocked on a full
+        # ainvoke, so the user saw nothing until the whole insight was written —
+        # hence the switch to astream below.
+        with mlflow.start_span(name="visualizer_insight") as span:
+            span.set_inputs({
+                "question": tracing.truncate(state["question"]),
+                "sql": state.get("existing_sql") or "",
+                "html_chars": len(state.get("existing_html") or ""),
+            })
+            # STREAMED, not ainvoke: `insight_delta` events carry the text out as the
+            # model writes it. The terminal `insight` event below is still emitted with
+            # the complete text, so a client that ignores the deltas behaves EXACTLY as
+            # before — see the contract note on _stream_text_deltas.
+            chunk_count = 0
+
+            def _on_delta(piece: str) -> None:
+                nonlocal chunk_count
+                chunk_count += 1
+                emit({"type": "insight_delta", "text": piece})
+
+            async with asyncio.timeout(30):
+                insight = await _stream_text_deltas(
+                    llm,
+                    [
+                        {"role": "system", "content": INSIGHT_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    _on_delta,
+                )
+            insight = insight.strip()
+            span.set_outputs({"insight_chars": len(insight), "delta_chunks": chunk_count})
+        # TERMINAL event, unchanged in shape and still carrying the FULL text. A client
+        # that ignores `insight_delta` sees exactly the old sequence.
         emit({"type": "insight", "text": insight})
         return {"insight_text": insight}
 
