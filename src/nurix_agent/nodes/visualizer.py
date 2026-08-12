@@ -428,6 +428,32 @@ def _chunk_text(content) -> str:
     unlike the whitespace-joining done for complete responses: these are consecutive
     fragments of one sentence, so inserting spaces between them would corrupt the text
     as it streams.
+
+    WHY "" AND NOT " " — and the divergence it theoretically leaves
+    --------------------------------------------------------------
+    The pre-streaming `ask_about_viz` branch normalized list content with
+    `" ".join(...)`. This uses `"".join(...)`, so for a response arriving as two
+    blocks "first"/"second" the old terminal text would have been "first second" and
+    the new one is "firstsecond" — a change to the TERMINAL event, which a client
+    ignoring deltas would see. That would breach the additive-contract guarantee.
+
+    MEASURED against the live AI Gateway (`databricks-claude-sonnet-5` via
+    cfg.ai_gateway_url, 2026-08-10), which is the only surface this code path talks to:
+      * `astream`: 59 of 59 `AIMessageChunk.content` values were plain `str`.
+        ZERO list-shaped chunks. (A second run: 42 deltas / 538 chars, same shape.)
+      * `ainvoke`: `.content` was `str` (642 chars), not a list.
+    langchain_openai builds each streaming chunk's content from the OpenAI-shaped
+    `choices[].delta.content`, which is a string field, so `str` is the structural
+    outcome for this gateway rather than a lucky sample.
+
+    So the list branch is NOT REACHED in practice and the divergence is THEORETICAL —
+    stated plainly rather than papered over. `""` is kept because it is the correct
+    join for the shape that would actually produce a list here (consecutive fragments
+    of one sentence, where injected spaces corrupt the text mid-stream); reverting to
+    `" "` to match the old terminal string would fix a divergence that cannot occur
+    at the cost of corrupting the case that could. If a future gateway DOES start
+    returning multi-block chunks, revisit this together with the terminal-event
+    comparison — the two must be decided as one.
     """
     if content is None:
         return ""
@@ -452,7 +478,7 @@ async def _stream_text_deltas(llm, messages, on_delta) -> str:
     Stream an LLM response, invoking `on_delta` per non-empty text fragment, and
     return the COMPLETE accumulated text.
 
-    THE EVENT CONTRACT (matters to the frontend):
+    THE EVENT CONTRACT (matters to the frontend) — SUCCESS PATH:
       * Progressive fragments go out as an ADDITIVE new event type; the terminal
         event carrying the full text is still emitted by the caller, unchanged.
       * A client that ignores the delta events therefore sees byte-identical
@@ -462,8 +488,28 @@ async def _stream_text_deltas(llm, messages, on_delta) -> str:
         client rendering deltas is expected to REPLACE its accumulated text with the
         terminal payload rather than append to it.
 
-    Accumulating here (rather than trusting the caller to concatenate deltas) keeps
-    the returned text the single source of truth for the terminal event.
+    THE EVENT CONTRACT — FAILURE PATH:
+      * REPLACE-not-append only holds if a terminal event ALWAYS arrives. It used to
+        not: when this stream raised after N deltas (30s timeout, or the LLM
+        erroring), the exception propagated straight past the caller's terminal emit.
+        The client was left rendering partial text with nothing authoritative to
+        replace it, and the SSE generator breaks on `error`, so not even `done`
+        followed. Partial model output sat on screen looking like a finished answer.
+      * The fix does NOT live here. This function deliberately does not catch: the
+        most likely mid-stream failure is the caller's `asyncio.timeout`, which works
+        by throwing CancelledError INTO this coroutine, and swallowing that here would
+        both break the timeout (it needs the CancelledError back to convert it into
+        TimeoutError) and break genuine cancellation when the SSE client disconnects.
+      * Instead the caller passes an `on_delta` that accumulates, wraps the call in
+        try/except, and emits its terminal event from the accumulated text on the way
+        out. See the `ask_about_viz` branch in visualizer_node for the authoritative
+        statement of the resulting client contract.
+      * The rule a client can rely on is unconditional: EVERY stream that emitted at
+        least one delta is followed by a terminal event that supersedes those deltas,
+        whether the stream succeeded or failed.
+
+    Accumulating here as well (rather than only in the caller) keeps the returned text
+    the single source of truth for the SUCCESS-path terminal event.
     """
     parts: list[str] = []
     async for chunk in llm.astream(messages):
@@ -597,34 +643,105 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
         with mlflow.start_span(name="visualizer_insight") as span:
             span.set_inputs({
                 "question": tracing.truncate(state["question"]),
-                "sql": state.get("existing_sql") or "",
+                # Genie-generated SQL can embed customer text as a literal
+                # (WHERE verbatim LIKE '%...%'), so it goes through the same bound as
+                # any other free text instead of being recorded unbounded.
+                "sql": tracing.truncate(state.get("existing_sql") or ""),
                 "html_chars": len(state.get("existing_html") or ""),
             })
             # STREAMED, not ainvoke: `insight_delta` events carry the text out as the
-            # model writes it. The terminal `insight` event below is still emitted with
-            # the complete text, so a client that ignores the deltas behaves EXACTLY as
-            # before — see the contract note on _stream_text_deltas.
-            chunk_count = 0
+            # model writes it.
+            #
+            # ============================================================
+            # THE `insight` / `insight_delta` CLIENT CONTRACT — AUTHORITATIVE
+            # ============================================================
+            # Kept in ONE comment block, success and failure together, so the two
+            # halves cannot drift apart. `_stream_text_deltas`'s docstring points here.
+            #
+            # RULE: `insight_delta` is a progressive PREVIEW and is never the final
+            # word. The terminal `insight` event REPLACES the client's accumulated
+            # delta text — it is never appended to. A terminal `insight` ALWAYS
+            # follows at least one `insight_delta`, on the success path AND on the
+            # failure path. A client may therefore render deltas immediately and
+            # unconditionally rely on being told what the real text is.
+            #
+            # The three sequences a client must handle:
+            #
+            #  (a) SUCCESS
+            #        insight_delta × N  →  insight{text, partial:false}  →  done
+            #      Replace accumulated text with `insight.text`. As before streaming.
+            #
+            #  (b) FAILURE AFTER N ≥ 1 DELTAS (30s timeout, or the LLM erroring)
+            #        insight_delta × N  →  insight{text, partial:true, error}  →  error
+            #      `insight.text` is the PARTIAL text that actually arrived, flagged
+            #      `partial: true` with `error` carrying the reason. Replace the
+            #      accumulated text with it and present it as incomplete (or discard
+            #      it) — do NOT render it as a finished answer. This event is the fix
+            #      for the original hole: previously the exception propagated past this
+            #      emit, the SSE generator broke on `error`, and the client was left
+            #      showing partial text with no correction and not even a `done`.
+            #      NOTE the `error` event still terminates the stream, so `done` does
+            #      NOT follow it — treat `error` as terminal, exactly as before.
+            #
+            #  (c) FAILURE BEFORE ANY DELTA
+            #        error
+            #      NO `insight` event at all. Nothing was rendered, so there is
+            #      nothing to correct and inventing an empty terminal event would just
+            #      make a client clear a pane it never filled. Identical to the
+            #      pre-streaming failure behaviour.
+            #
+            # `partial` is present on EVERY terminal `insight` (explicitly false on
+            # success) so a client can branch on the field itself rather than on its
+            # absence — an absent key and a false key must not mean different things.
+            deltas: list[str] = []
 
             def _on_delta(piece: str) -> None:
-                nonlocal chunk_count
-                chunk_count += 1
+                deltas.append(piece)
                 emit({"type": "insight_delta", "text": piece})
 
-            async with asyncio.timeout(30):
-                insight = await _stream_text_deltas(
-                    llm,
-                    [
-                        {"role": "system", "content": INSIGHT_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    _on_delta,
-                )
+            try:
+                async with asyncio.timeout(30):
+                    insight = await _stream_text_deltas(
+                        llm,
+                        [
+                            {"role": "system", "content": INSIGHT_SYSTEM_PROMPT},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        _on_delta,
+                    )
+            except BaseException as e:
+                # BaseException on purpose: asyncio.timeout surfaces as TimeoutError,
+                # but a client disconnect cancels this task and raises CancelledError,
+                # which is NOT an Exception. Both leave the same orphaned partial on a
+                # client that was rendering deltas, so both must emit the terminal
+                # correction. The error is always RE-RAISED — this recovers the client
+                # contract, it does not swallow the failure. run_graph still turns it
+                # into the `error` event that reports the real cause.
+                partial = "".join(deltas).strip()
+                if partial:
+                    emit({
+                        "type": "insight",
+                        "text": partial,
+                        "partial": True,
+                        "error": str(e) or type(e).__name__,
+                    })
+                span.set_outputs({
+                    "insight_chars": len(partial),
+                    "delta_chunks": len(deltas),
+                    "partial": True,
+                    "error": tracing.truncate(str(e) or type(e).__name__),
+                })
+                raise
             insight = insight.strip()
-            span.set_outputs({"insight_chars": len(insight), "delta_chunks": chunk_count})
-        # TERMINAL event, unchanged in shape and still carrying the FULL text. A client
-        # that ignores `insight_delta` sees exactly the old sequence.
-        emit({"type": "insight", "text": insight})
+            span.set_outputs({
+                "insight_chars": len(insight),
+                "delta_chunks": len(deltas),
+                "partial": False,
+            })
+        # TERMINAL event, unchanged in shape (`partial: false` is additive) and still
+        # carrying the FULL text. A client that ignores `insight_delta` sees exactly
+        # the old sequence. See the contract block above for the failure sequences.
+        emit({"type": "insight", "text": insight, "partial": False})
         return {"insight_text": insight}
 
     # mode == "chat": parallel chart generation.

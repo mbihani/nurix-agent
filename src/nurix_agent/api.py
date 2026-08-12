@@ -77,7 +77,11 @@ async def run_graph(queue: asyncio.Queue, initial_state: AgentState):
                 "chart_count": len((result or {}).get("chart_htmls") or []),
                 "sub_question_count": len((result or {}).get("sub_questions") or []),
                 "is_relevant": bool((result or {}).get("is_relevant")),
-                "rejection_reason": (result or {}).get("rejection_reason"),
+                # Model-authored free text, so bounded through the same chokepoint as
+                # everything else rather than recorded unbounded.
+                "rejection_reason": tracing.truncate(
+                    (result or {}).get("rejection_reason")
+                ) or None,
                 "insight_chars": len((result or {}).get("insight_text") or ""),
             })
     except Exception as e:

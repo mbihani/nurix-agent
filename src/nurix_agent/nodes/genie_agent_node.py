@@ -10,6 +10,7 @@ chart generation and the window.CHART_DATA injection path are reused unchanged.
 import mlflow
 from langchain_core.runnables import RunnableConfig
 
+from .. import tracing
 from ..config import AppConfig
 from ..genie_agent import run_agent_mode
 from ..narrative import clean_genie_narrative
@@ -106,7 +107,11 @@ async def genie_agent_node(state: AgentState, config: RunnableConfig) -> dict:
     emit({"type": "thinking", "text": "Starting deep research (this takes ~40-70s)..."})
 
     with mlflow.start_span(name="genie_agent") as span:
-        span.set_inputs({"question": question, "deep_research": True})
+        span.set_inputs({
+            # Bounded like every other free-text attribute, not recorded unbounded.
+            "question": tracing.truncate(question),
+            "deep_research": True,
+        })
         result = await run_agent_mode(
             question,
             emit,
@@ -118,7 +123,7 @@ async def genie_agent_node(state: AgentState, config: RunnableConfig) -> dict:
             "reasoning_count": result.get("reasoning_count", 0),
             "sub_query_count": len(result.get("sub_queries", [])),
             "narrative_chars": len(result.get("text") or ""),
-            "result_error": result.get("result_error"),
+            "result_error": tracing.truncate(result.get("result_error")) or None,
         })
 
     if result.get("result_error"):

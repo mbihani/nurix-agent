@@ -3,6 +3,7 @@ import json
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 import mlflow
+from .. import tracing
 from ..config import AppConfig, get_databricks_token
 from ..state import AgentState
 
@@ -61,7 +62,8 @@ async def router_node(state: AgentState, config: RunnableConfig) -> dict:
     )
 
     with mlflow.start_span(name="router") as span:
-        span.set_inputs({"question": state["question"]})
+        # The user's question is customer-adjacent free text; bounded, not unbounded.
+        span.set_inputs({"question": tracing.truncate(state["question"])})
         try:
             async with asyncio.timeout(30):
                 response = await llm.ainvoke([
@@ -84,7 +86,15 @@ async def router_node(state: AgentState, config: RunnableConfig) -> dict:
             result = json.loads(content)
         except json.JSONDecodeError:
             result = {"is_relevant": False, "rejection_reason": "Could not parse routing decision", "sub_questions": [], "chart_hints": []}
-        span.set_outputs(result)
+        # `result` is model-authored JSON, so it must not go into the span verbatim:
+        # `rejection_reason` and the decomposed sub-questions are unbounded free text.
+        # Bounded field-by-field through the one chokepoint rather than dumped whole.
+        span.set_outputs({
+            "is_relevant": bool(result.get("is_relevant")),
+            "rejection_reason": tracing.truncate(result.get("rejection_reason")) or None,
+            "sub_questions": [tracing.truncate(q) for q in result.get("sub_questions") or []],
+            "chart_hints": [tracing.truncate(h) for h in result.get("chart_hints") or []],
+        })
 
     if not result.get("is_relevant", False):
         emit({"type": "rejected", "reason": result.get("rejection_reason", "Not relevant")})

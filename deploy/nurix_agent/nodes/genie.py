@@ -386,7 +386,11 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, em
         columns = result.get("columns") or []
         rows = result.get("rows") or []
         span.set_outputs({
-            "sql": result.get("sql") or "",
+            # Genie-generated SQL is the highest-exposure attribute in this app: it can
+            # embed customer feedback text as a literal (WHERE verbatim LIKE '%...%').
+            # Bounded through the same chokepoint as every other free text rather than
+            # recorded unbounded.
+            "sql": tracing.truncate(result.get("sql") or ""),
             "row_count": len(rows),
             "column_count": len(columns),
             "columns": tracing.column_names(columns),
