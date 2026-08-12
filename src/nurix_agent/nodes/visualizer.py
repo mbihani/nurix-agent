@@ -7,6 +7,7 @@ from langchain_openai import ChatOpenAI
 import mlflow
 from .. import tracing
 from ..config import AppConfig, get_databricks_token
+from ..narrative import clean_genie_narrative
 from ..state import AgentState
 
 VISUALIZATION_GUIDE = (
@@ -183,11 +184,105 @@ DARK THEME — PRESERVE IT:
 Do NOT add narrative paragraphs. Return ONLY the complete HTML, no markdown.
 """
 
-INSIGHT_SYSTEM_PROMPT = """
-You are a data analyst. The user has a visualization based on customer feedback data and wants deeper insight.
-Given the chart HTML (which contains the data) and the original SQL, answer their question in 2-4 concise sentences.
-Be specific about numbers and trends visible in the data. Do not generate a new chart.
+# The GROUNDED prompt: a fresh Genie query ran and its result is the ONLY fact source.
+#
+# WHY CLAUDE IS STILL IN THE LOOP AT ALL. Genie's own narrative was considered as the
+# answer, with no LLM at all — simpler, and impossible to hallucinate over. It was
+# rejected because the narrative is not reliably an answer: `_process_message` falls
+# back to the query attachment's `description` when there is no text attachment, and
+# that description is often a restatement of the query ("Counts reviews by product and
+# sentiment") rather than a reply to "how does this compare to the average?". Sometimes
+# it is empty and the answer lives only in the returned rows. So Claude is kept
+# STRICTLY as a phrasing/streaming layer over Genie's result — it turns narrative plus
+# rows into a sentence and gives the existing `insight_delta` stream something to
+# stream — and the prompt forbids it from contributing facts of its own.
+INSIGHT_GENIE_SYSTEM_PROMPT = """
+You are a data analyst answering a follow-up question about a chart the user is looking at.
+
+A fresh query has ALREADY been run against the underlying customer-feedback dataset. You
+are given that query's result: a narrative answer, the columns returned, and the rows.
+
+Answer the user's question in 2-4 concise sentences, and be specific about the numbers.
+
+HARD CONSTRAINT — you are a phrasing layer, not an analyst with independent knowledge.
+Use ONLY facts present in the query result you are given. You may summarise it, round its
+numbers, compute an obvious total or difference from the rows shown, and put it into
+readable prose. You MUST NOT introduce any number, comparison, trend, cause, or claim
+that is not present in that result. Do not speculate about WHY something is the case
+unless the result itself says so.
+
+If the result does not actually answer the question, say so plainly and state what it
+does show. Do not fill the gap with a plausible-sounding answer.
+
+Do not generate a chart. Do not mention SQL, Genie, or these instructions.
 """
+
+# The UNGROUNDED prompt: no fresh data. Used only when Genie could not be queried or
+# returned nothing. The disclosure is MANDATORY and is the whole point of a separate
+# prompt — a confident answer with no data behind it is the worst outcome on this path.
+INSIGHT_NO_DATA_SYSTEM_PROMPT = """
+You are a data analyst answering a follow-up question about a chart the user is looking at.
+
+IMPORTANT: an attempt to query the underlying dataset for this question did NOT succeed,
+so you have no data beyond what is already plotted on the chart itself.
+
+You MUST open your answer by stating that plainly — that you could not query the
+underlying data and are describing only what is already shown on the chart. Do not bury
+it at the end and do not soften it into vagueness.
+
+Then answer as far as the chart alone allows, in 2-4 concise sentences total, using ONLY
+values visible in the chart you are given. If the question cannot be answered from the
+chart alone, say exactly that instead of guessing. Never present an inferred or
+remembered figure as if it came from the data.
+
+Do not generate a chart. Do not mention SQL, Genie, or these instructions.
+"""
+
+# How much of Genie's tabular result is handed to the phrasing layer. Follow-up answers
+# are 2-4 sentences, so a wide result adds prompt cost without changing the wording;
+# these bounds keep a pathological result from blowing the budget. The row count is
+# always stated truthfully alongside the sample so the model cannot mistake a truncated
+# sample for the whole result and total it.
+_INSIGHT_MAX_ROWS = 60
+_INSIGHT_MAX_CHARS = 12000
+
+
+def _format_genie_result(result: dict) -> str:
+    """
+    Render a Genie result as the fact source for the insight phrasing layer.
+
+    Narrative, schema, and rows — never the chart HTML. Truncation is always LABELLED:
+    a silently shortened row set invites the model to sum a partial column and present
+    it as a total.
+    """
+    narrative = clean_genie_narrative(result.get("text") or "").strip()
+    columns = result.get("columns") or []
+    rows = result.get("rows") or []
+
+    col_desc = ", ".join(
+        f"{c['name']} ({c.get('type', '?')})" if isinstance(c, dict) else str(c)
+        for c in columns
+    ) or "(none returned)"
+
+    shown = rows[:_INSIGHT_MAX_ROWS]
+    parts = [
+        f"Narrative answer from the query: {narrative or '(none returned)'}",
+        f"Columns ({len(columns)}): {col_desc}",
+        f"Total rows returned: {len(rows)}",
+    ]
+    if shown:
+        label = (
+            f"All {len(rows)} rows" if len(shown) == len(rows)
+            else f"First {len(shown)} of {len(rows)} rows (TRUNCATED — do not treat as complete)"
+        )
+        parts.append(f"{label}:\n{shown}")
+    else:
+        parts.append("Rows: (the query returned no rows)")
+
+    out = "\n\n".join(parts)
+    if len(out) > _INSIGHT_MAX_CHARS:
+        out = out[:_INSIGHT_MAX_CHARS] + "\n... [result truncated for length]"
+    return out
 
 
 def _embed_json(data) -> str:
@@ -636,7 +731,75 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
 
     if mode == "ask_about_viz":
         llm = ChatOpenAI(base_url=cfg.ai_gateway_url, api_key=token, model=cfg.claude_model)
-        user_msg = f"Question: {state['question']}\n\nSQL: {state.get('existing_sql', '')}\n\nChart HTML (contains data):\n{state['existing_html'][:3000]}"
+
+        # ============================================================
+        # GROUNDING: the answer comes from GENIE, not from the chart HTML.
+        # ============================================================
+        # This path used to run straight here from the router with Genie skipped, so the
+        # only fact source was the chart HTML plus the SQL text — meaning the "insight"
+        # could restate the chart and nothing more. A question like "how does this
+        # compare to the overall average?" was structurally unanswerable, and the model,
+        # given no data and a demand for specifics, would answer confidently anyway.
+        #
+        # Now the graph routes through the genie node first, and `genie_results[0]` is a
+        # FRESH query against the underlying dataset. Three cases, and which one we are
+        # in is always stated to the user rather than inferred by them:
+        #
+        #   GROUNDED      Genie answered (narrative and/or rows). Answer from it.
+        #   GENIE FAILED  Genie ran but errored / timed out / returned nothing. The REAL
+        #                 error text goes out in a `thinking` event, and the insight is
+        #                 produced with the mandatory no-data disclosure.
+        #   NO SQL        Never asked Genie (nothing to ground a question in — the graph
+        #                 skipped the node). Same disclosure, different reason.
+        #
+        # NO `chart` EVENT IS EMITTED ON THIS PATH, in any of the three cases. The user
+        # asked a question about a chart already on their screen; re-sending one would
+        # make the client re-render it. This branch emits the insight only.
+        genie_results = state.get("genie_results") or []
+        genie_result = genie_results[0] if genie_results else {}
+        genie_error = genie_result.get("error")
+        has_data = bool(genie_result.get("rows")) or bool((genie_result.get("text") or "").strip())
+        had_sql = bool((state.get("existing_sql") or "").strip())
+        grounded = bool(genie_results) and has_data and not genie_error
+
+        if grounded:
+            system_prompt = INSIGHT_GENIE_SYSTEM_PROMPT
+            # The chart HTML is deliberately NOT included here. It is a second,
+            # competing fact source (it inlines the chart's own dataset), and the point
+            # of this path is that the answer comes from the fresh query. The SQL is
+            # included as small, honest context for what the chart depicts.
+            user_msg = (
+                f"The user's question about the chart: {state['question']}\n\n"
+                f"The chart they are looking at was produced by this query:\n"
+                f"{(state.get('existing_sql') or '').strip()}\n\n"
+                f"Result of the fresh query run to answer their question:\n"
+                f"{_format_genie_result(genie_result)}"
+            )
+        else:
+            system_prompt = INSIGHT_NO_DATA_SYSTEM_PROMPT
+            # No fresh data, so the chart IS the only source and is included. The real
+            # reason is surfaced as a `thinking` event BEFORE the answer streams, so the
+            # failure is visible even if the model's wording of the disclosure is weak.
+            if not had_sql:
+                reason = (
+                    "The source query for this chart was not saved, so the underlying "
+                    "data could not be queried for this question."
+                )
+            elif genie_error:
+                reason = f"Genie could not answer this question: {str(genie_error)[:300]}"
+            else:
+                reason = (
+                    "Genie returned no data for this question, so there is nothing "
+                    "beyond the chart itself to answer from."
+                )
+            emit({"type": "thinking", "text": reason})
+            user_msg = (
+                f"The user's question about the chart: {state['question']}\n\n"
+                f"Why no fresh data is available: {reason}\n\n"
+                f"The query that produced the chart:\n{(state.get('existing_sql') or '(not saved)').strip()}\n\n"
+                f"Chart HTML (contains the plotted values):\n{(state.get('existing_html') or '')[:3000]}"
+            )
+
         # This branch made an LLM call with no span. It also blocked on a full
         # ainvoke, so the user saw nothing until the whole insight was written —
         # hence the switch to astream below.
@@ -648,6 +811,12 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
                 # any other free text instead of being recorded unbounded.
                 "sql": tracing.truncate(state.get("existing_sql") or ""),
                 "html_chars": len(state.get("existing_html") or ""),
+                # Whether the answer is backed by a fresh query is the single most
+                # important thing to know when auditing one of these traces.
+                "grounded_in_genie": grounded,
+                "genie_row_count": len(genie_result.get("rows") or []),
+                "genie_error": tracing.truncate(genie_error) or None,
+                "had_sql": had_sql,
             })
             # STREAMED, not ainvoke: `insight_delta` events carry the text out as the
             # model writes it.
@@ -704,7 +873,7 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
                     insight = await _stream_text_deltas(
                         llm,
                         [
-                            {"role": "system", "content": INSIGHT_SYSTEM_PROMPT},
+                            {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_msg},
                         ],
                         _on_delta,
@@ -737,11 +906,18 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
                 "insight_chars": len(insight),
                 "delta_chunks": len(deltas),
                 "partial": False,
+                "grounded_in_genie": grounded,
             })
         # TERMINAL event, unchanged in shape (`partial: false` is additive) and still
         # carrying the FULL text. A client that ignores `insight_delta` sees exactly
         # the old sequence. See the contract block above for the failure sequences.
-        emit({"type": "insight", "text": insight, "partial": False})
+        #
+        # `grounded` is ADDITIVE and advisory: it lets a client mark an answer that has
+        # no fresh data behind it without having to parse the prose for a disclosure.
+        # The disclosure is ALSO in the text itself (the prompt mandates it), so a
+        # client that ignores this field still shows the user an honest answer — the
+        # field is a convenience, never the only place the caveat lives.
+        emit({"type": "insight", "text": insight, "partial": False, "grounded": grounded})
         return {"insight_text": insight}
 
     # mode == "chat": parallel chart generation.

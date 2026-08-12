@@ -11,6 +11,10 @@ class AgentState(TypedDict):
     existing_html: str | None
     existing_sql: str | None
     refine_instruction: str | None
+    # The Genie conversation that produced the chart being asked about, when the
+    # client supplied one. Lets the `ask_about_viz` follow-up CONTINUE that
+    # conversation (full prior context) instead of starting a fresh one from the SQL.
+    genie_conversation_id: str | None
     # Router output
     is_relevant: bool
     rejection_reason: str | None

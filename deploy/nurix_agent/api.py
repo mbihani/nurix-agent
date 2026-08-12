@@ -169,6 +169,7 @@ async def chat(req: ChatRequest):
         "existing_html": None,
         "existing_sql": None,
         "refine_instruction": None,
+        "genie_conversation_id": None,
         "is_relevant": False,
         "rejection_reason": None,
         "sub_questions": [],
@@ -191,6 +192,8 @@ async def refine(req: RefineRequest):
         "existing_html": req.chart_html,
         "existing_sql": req.sql,
         "refine_instruction": req.instruction,
+        # `refine` never reaches the genie node, so there is no conversation to continue.
+        "genie_conversation_id": None,
         "is_relevant": False,
         "rejection_reason": None,
         "sub_questions": [req.instruction],
@@ -205,6 +208,21 @@ async def refine(req: RefineRequest):
 
 @app.post("/ask_about_viz")
 async def ask_about_viz(req: AskAboutVizRequest):
+    """
+    Ask a follow-up question about a chart, answered from the GENIE SPACE.
+
+    This endpoint used to answer from the chart HTML and its SQL alone, with Genie
+    skipped entirely, so it could only restate what was already on screen. It now routes
+    the question — plus the chart's source query as context — to the Genie space and
+    grounds the answer in what Genie returns. `deep_research` is deliberately NOT
+    available here: agent mode costs ~70-90s versus ~15s, and this is an interactive
+    follow-up on a chart the user is looking at.
+
+    Event stream (all additive; the deployed nurix-nlviz ignores types it does not
+    know): `thinking` × N, `sql` (the query Genie actually ran), `genie_text`,
+    `insight_delta` × N, terminal `insight`, `done`. NO `chart` event is emitted — the
+    chart is already on the user's screen.
+    """
     state: AgentState = {
         "question": req.question,
         "session_id": req.session_id,
@@ -213,8 +231,12 @@ async def ask_about_viz(req: AskAboutVizRequest):
         "existing_html": req.chart_html,
         "existing_sql": req.sql,
         "refine_instruction": None,
+        "genie_conversation_id": req.conversation_id,
         "is_relevant": False,
         "rejection_reason": None,
+        # Placeholder only. The router REPLACES this with the composed Genie question
+        # that carries the chart context (see router.compose_viz_question); the genie
+        # node runs whatever is in `sub_questions`.
         "sub_questions": [req.question],
         "chart_hints": ["insight"],
         "genie_results": [],

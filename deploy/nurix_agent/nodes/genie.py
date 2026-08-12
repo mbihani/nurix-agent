@@ -334,28 +334,65 @@ def _process_message(w: WorkspaceClient, space_id: str, msg: GenieMessage) -> di
     return out
 
 
-def _run_genie_conversation(space_id: str, host: str, question: str) -> dict:
+def _run_genie_conversation(
+    space_id: str, host: str, question: str, conversation_id: str | None = None
+) -> dict:
     """
     Blocking Genie conversation for one sub-question, run in a worker thread.
 
     Uses a fresh WorkspaceClient per call (per-request auth pattern) so the
     calls run as the deployed app's service principal in prod and as the local
-    user's profile locally. start_conversation_and_wait handles polling until
-    the message reaches a terminal status.
+    user's profile locally. The `*_and_wait` helpers poll until the message
+    reaches a terminal status.
+
+    When `conversation_id` is supplied the question is posted as a follow-up MESSAGE
+    in that existing conversation, so Genie answers with the full prior context of the
+    conversation that produced the chart — strictly better than reconstructing context
+    by pasting the SQL into a fresh conversation. Continuation is best-effort: a stored
+    conversation can be expired, deleted, or owned by a different space, and none of
+    those should turn an answerable follow-up into an error. So ANY failure to continue
+    falls back to a fresh conversation, and the fallback is REPORTED in the returned
+    dict (`continuation_error`) rather than hidden — the caller surfaces it, because
+    "Genie answered without the prior context" is a real difference in answer quality.
     """
     w = WorkspaceClient(host=host)
-    msg = w.genie.start_conversation_and_wait(
-        space_id,
-        question,
-        # Give the SDK poll loop a little less than the outer asyncio budget so
-        # it surfaces a clean SDK timeout before the hard asyncio backstop fires.
-        timeout=datetime.timedelta(seconds=GENIE_TIMEOUT_SECONDS - 5),
-    )
-    return _process_message(w, space_id, msg)
+    # A little less than the outer asyncio budget so the SDK surfaces a clean
+    # timeout before the hard asyncio backstop fires.
+    timeout = datetime.timedelta(seconds=GENIE_TIMEOUT_SECONDS - 5)
+
+    continuation_error: str | None = None
+    msg = None
+    if conversation_id:
+        try:
+            msg = w.genie.create_message_and_wait(
+                space_id, conversation_id, question, timeout=timeout
+            )
+        except Exception as e:
+            continuation_error = str(e)
+
+    if msg is None:
+        msg = w.genie.start_conversation_and_wait(space_id, question, timeout=timeout)
+
+    out = _process_message(w, space_id, msg)
+    out["continued_conversation"] = bool(conversation_id and continuation_error is None)
+    if continuation_error is not None:
+        out["continuation_error"] = continuation_error
+    return out
 
 
-async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, emit) -> dict:
-    """Query the space-scoped Genie Conversation API for a single sub-question."""
+async def _call_genie_for_question(
+    question: str, index: int, cfg: AppConfig, emit, conversation_id: str | None = None
+) -> dict:
+    """
+    Query the space-scoped Genie Conversation API for a single sub-question.
+
+    Every returned dict carries an `error` key (None when the call succeeded). Callers
+    that need to state whether the answer is actually backed by data — the
+    `ask_about_viz` insight in particular — depend on that: an empty result used to be
+    indistinguishable from a successful query returning nothing, which is exactly the
+    silent-degradation shape this project keeps paying for. The key is ADDITIVE; the
+    chart path reads only text/sql/columns/rows and is unaffected.
+    """
     emit({"type": "thinking", "text": f"Querying Genie for: {question[:60]}...", "index": index})
 
     # This PLAIN path previously had no span at all, so a slow or failing Genie
@@ -376,12 +413,13 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, em
         # as an empty "no data" chart or an abrupt disconnect.
         try:
             result = await asyncio.to_thread(
-                _run_genie_conversation, cfg.genie_space_id, cfg.databricks_host, question
+                _run_genie_conversation,
+                cfg.genie_space_id, cfg.databricks_host, question, conversation_id,
             )
         except Exception as e:
             emit({"type": "thinking", "text": f"Genie query failed: {str(e)[:200]}", "index": index})
             span.set_outputs({"error": tracing.truncate(str(e)), "row_count": 0, "column_count": 0})
-            return {"text": "", "sql": "", "columns": [], "rows": []}
+            return {"text": "", "sql": "", "columns": [], "rows": [], "error": str(e)}
 
         columns = result.get("columns") or []
         rows = result.get("rows") or []
@@ -397,6 +435,19 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, em
             "narrative_chars": len(result.get("text") or ""),
             "failed": bool(result.get("failed")),
             "result_error": tracing.truncate(result.get("result_error")) or None,
+            "continued_conversation": bool(result.get("continued_conversation")),
+            "continuation_error": tracing.truncate(result.get("continuation_error")) or None,
+        })
+
+    # A requested conversation continuation that silently became a fresh conversation
+    # changes the answer's context, so it is reported rather than swallowed.
+    if result.get("continuation_error"):
+        emit({
+            "type": "thinking",
+            "text": "Could not continue the chart's original Genie conversation "
+                    f"({str(result['continuation_error'])[:150]}); asked as a new "
+                    "conversation with the chart's query as context instead.",
+            "index": index,
         })
 
     if result.get("failed"):
@@ -415,11 +466,22 @@ async def _call_genie_for_question(question: str, index: int, cfg: AppConfig, em
         if result.get("result_error"):
             emit({"type": "thinking", "text": f"Genie result retrieval failed: {result['result_error'][:200]}", "index": index})
 
+    # A message that reached a terminal FAILED/CANCELLED status carries its Databricks
+    # error text in `text`; promote it to `error` so a caller can tell "Genie failed"
+    # from "Genie answered".
+    error: str | None = None
+    if result.get("failed"):
+        error = result.get("text") or "Genie query failed"
+    elif result.get("result_error"):
+        error = result["result_error"]
+
     return {
         "text": result.get("text", ""),
         "sql": result.get("sql", ""),
         "columns": result.get("columns", []),
         "rows": result.get("rows", []),
+        "error": error,
+        "continued_conversation": bool(result.get("continued_conversation")),
     }
 
 
@@ -428,16 +490,23 @@ async def genie_node(state: AgentState, config: RunnableConfig) -> dict:
     emit = state["emit"]
 
     sub_questions = state["sub_questions"]
+    # Only ever set by the `ask_about_viz` path, and only when the client supplied the
+    # chart's originating conversation. None keeps the plain chat behaviour identical:
+    # a fresh conversation per sub-question.
+    conversation_id = state.get("genie_conversation_id")
 
     async def _run_with_timeout(q: str, i: int) -> dict:
         # Hard backstop around the whole conversation so one hung task can't
         # block the gather (and thus the SSE stream) indefinitely.
         try:
             async with asyncio.timeout(GENIE_TIMEOUT_SECONDS):
-                return await _call_genie_for_question(q, i, cfg, emit)
+                return await _call_genie_for_question(q, i, cfg, emit, conversation_id)
         except asyncio.TimeoutError:
             emit({"type": "thinking", "text": f"Genie timed out for: {q[:60]}", "index": i})
-            return {"text": "", "sql": "", "columns": [], "rows": []}
+            return {
+                "text": "", "sql": "", "columns": [], "rows": [],
+                "error": f"Genie timed out after {GENIE_TIMEOUT_SECONDS}s",
+            }
 
     # Run all sub-questions in parallel.
     tasks = [_run_with_timeout(q, i) for i, q in enumerate(sub_questions)]
@@ -450,7 +519,10 @@ async def genie_node(state: AgentState, config: RunnableConfig) -> dict:
             # text instead of silently substituting an empty dataset.
             q = sub_questions[i] if i < len(sub_questions) else ""
             emit({"type": "thinking", "text": f"Genie query failed for '{q[:60]}': {str(r)[:200]}", "index": i})
-            genie_results.append({"text": "", "sql": "", "columns": [], "rows": []})
+            genie_results.append({
+                "text": "", "sql": "", "columns": [], "rows": [],
+                "error": f"{type(r).__name__}: {r}",
+            })
         else:
             genie_results.append(r)
 
