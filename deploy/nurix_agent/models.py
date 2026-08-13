@@ -25,7 +25,20 @@ class AskAboutVizRequest(BaseModel):
     # predates SQL storage; instead the answer is produced WITHOUT fresh data and says
     # so in as many words (see the visualizer's ask_about_viz branch). Existing clients
     # that always send SQL are unaffected.
-    sql: str | None = Field(default=None, max_length=10000)
+    # Cap LOWERED from 10000 to 4000. This value is interpolated into the
+    # natural-language question sent to the Genie space (delimited and framed as data —
+    # see router.compose_viz_question), so its size is now attack surface as well as
+    # prompt budget: 10000 characters is far more room than any generated chart query
+    # needs, and the extra room only helps a crafted value.
+    #
+    # 4000 is still ~8x the largest Genie-generated query observed on this space
+    # (~500 chars, including multi-CTE deep-research queries), so it is generous for
+    # real input. A LONGER value is rejected with a 422 rather than silently truncated,
+    # deliberately: truncating SQL can cut mid-clause and would hand Genie a query that
+    # means something different from the chart the user is looking at, which is exactly
+    # the kind of quiet wrongness this endpoint is supposed to avoid. That is a different
+    # case from sql being ABSENT, which degrades honestly rather than 422-ing.
+    sql: str | None = Field(default=None, max_length=4000)
     question: str = Field(min_length=1, max_length=2000)
     session_id: str = "default"
     # The Genie conversation that originally produced this chart. Pins store it, and

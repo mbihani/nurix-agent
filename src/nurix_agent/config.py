@@ -29,6 +29,32 @@ class AppConfig(BaseSettings):
     # turn tracing off for a local run.
     mlflow_tracking_uri: str = Field(default="databricks", validation_alias="MLFLOW_TRACKING_URI")
 
+    # Whether `ask_about_viz` may CONTINUE the Genie conversation named by the request's
+    # `conversation_id` instead of starting a fresh one.
+    #
+    # DEFAULTS OFF, and must stay off until conversation OWNERSHIP CAN BE VERIFIED.
+    # The gap is not in the SDK call, it is in the trust model: nothing binds a submitted
+    # `conversation_id` to the submitting user, to `session_id`, or to the chart being
+    # asked about, and in production every Genie call runs as ONE app service principal.
+    # So a caller who supplies a conversation ID belonging to a DIFFERENT app session
+    # could reach that conversation's prior context, because the SP — not the end user —
+    # is what Genie authorizes. The IDs are high entropy and the deployed nurix-nlviz
+    # never sends the field, so this is latent rather than live; gating it costs nothing
+    # today and removes the latent cross-session exposure.
+    #
+    # BEFORE ENABLING THIS, one of the following must exist:
+    #   * server-side provenance: the app stores which conversation produced which pin,
+    #     for which user/session, and the request is checked against that record rather
+    #     than trusting the id in the payload; or
+    #   * a Genie-side ownership check that the caller (not just the SP) may read the
+    #     conversation.
+    # With the flag off the field is ACCEPTED AND IGNORED — a fresh conversation is
+    # started with the chart's SQL as context, which is the behaviour every current
+    # client already gets.
+    enable_conversation_continuation: bool = Field(
+        default=False, validation_alias="ENABLE_CONVERSATION_CONTINUATION"
+    )
+
 
 def get_databricks_token(cfg: 'AppConfig') -> str:
     """Fetch a fresh Databricks bearer token from the SDK."""

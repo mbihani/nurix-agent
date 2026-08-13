@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import logging
 import re
 
 import mlflow
@@ -11,6 +12,8 @@ from .. import tracing
 from ..config import AppConfig
 from ..narrative import clean_genie_narrative
 from ..state import AgentState
+
+logger = logging.getLogger(__name__)
 
 # Bound the whole Genie conversation (start + internal poll + result fetch) for a
 # single sub-question so one stuck space can't hang the SSE stream forever.
@@ -493,11 +496,32 @@ async def genie_node(state: AgentState, config: RunnableConfig) -> dict:
     # Only ever set by the `ask_about_viz` path, and only when the client supplied the
     # chart's originating conversation. None keeps the plain chat behaviour identical:
     # a fresh conversation per sub-question.
-    conversation_id = state.get("genie_conversation_id")
+    #
+    # GATED OFF BY DEFAULT. `cfg.enable_conversation_continuation` is False until
+    # conversation ownership can be verified — nothing binds a submitted id to the
+    # submitting user or the chart, and every Genie call runs as one app service
+    # principal, so an id from another session could otherwise be resumed. See the flag's
+    # definition in config.py for the prerequisites to enabling it. With the flag off the
+    # field is accepted and IGNORED, which is what every current client already gets.
+    conversation_id = None
+    if getattr(cfg, "enable_conversation_continuation", False):
+        conversation_id = state.get("genie_conversation_id")
+    elif state.get("genie_conversation_id"):
+        logger.info(
+            "ask_about_viz supplied a Genie conversation_id but continuation is "
+            "disabled (enable_conversation_continuation=False); starting a fresh "
+            "conversation with the chart SQL as context instead."
+        )
 
     async def _run_with_timeout(q: str, i: int) -> dict:
         # Hard backstop around the whole conversation so one hung task can't
         # block the gather (and thus the SSE stream) indefinitely.
+        #
+        # KNOWN, PRE-EXISTING (not introduced or fixed here): this bounds how long the
+        # SSE REQUEST waits, not the worker thread. `asyncio.to_thread` cannot cancel a
+        # blocking SDK poll, so on timeout the thread keeps running to completion in the
+        # background while the request moves on. That is the existing pattern everywhere
+        # in this repo; changing it is a separate piece of work.
         try:
             async with asyncio.timeout(GENIE_TIMEOUT_SECONDS):
                 return await _call_genie_for_question(q, i, cfg, emit, conversation_id)
