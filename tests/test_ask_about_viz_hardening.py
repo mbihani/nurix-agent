@@ -194,6 +194,91 @@ def test_cancelled_error_is_re_raised_even_when_both_cleanups_fail():
         raise AssertionError("CancelledError did not propagate")
 
 
+class _HostileLogger:
+    """A logger whose `warning` always raises — the FIX 1 trigger."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def warning(self, *a, **k):
+        self.calls += 1
+        raise RuntimeError("logging backend exploded")
+
+
+def test_original_exception_survives_a_raising_logger_during_emit_cleanup():
+    """
+    BLOCKER 1(c): the cleanup handlers log their own failure. That log call sits between
+    the cleanup failure and the bare `raise`, so if IT raises, the caller observes the
+    LOGGING error instead of the real cause. `_log_cleanup_failure` must absorb it.
+    """
+    llm = _FakeLLM(chunks=("half ", "an answer"), raise_after=_OriginalError("real cause"))
+
+    def hostile_emit(event):
+        if event.get("type") == "insight":
+            raise RuntimeError("transport is gone")
+
+    hostile = _HostileLogger()
+    orig_logger = viz.logger
+    viz.logger = hostile
+    try:
+        _run(_state(), llm, emit=hostile_emit)
+    except _OriginalError as e:
+        assert str(e) == "real cause", e
+        assert hostile.calls >= 1, "the raising log path was never exercised"
+        print("PASS a raising logger during emit-cleanup does not mask the original error")
+    except BaseException as e:
+        raise AssertionError(f"original exception was MASKED by {type(e).__name__}: {e}")
+    else:
+        raise AssertionError("the original exception did not propagate at all")
+    finally:
+        viz.logger = orig_logger
+
+
+def test_cancelled_error_survives_both_cleanups_and_both_logs_failing():
+    """
+    The worst case, and the reason FIX 1 is worth doing: CancelledError is not an
+    Exception, and replacing it breaks cooperative cancellation. It must survive BOTH
+    cleanup steps failing AND both of their log calls failing.
+    """
+    llm = _FakeLLM(chunks=("some ", "text"), raise_after=asyncio.CancelledError())
+
+    def hostile_emit(event):
+        if event.get("type") == "insight":
+            raise RuntimeError("transport is gone")
+
+    hostile = _HostileLogger()
+    orig_logger = viz.logger
+    viz.logger = hostile
+    try:
+        _run(_state(), llm, emit=hostile_emit, span_factory=lambda **kw: _BoomSpan())
+    except asyncio.CancelledError:
+        # Both handlers must have tried to log: emit-cleanup and span-cleanup.
+        assert hostile.calls == 2, f"expected 2 log attempts, got {hostile.calls}"
+        print("PASS CancelledError survives both cleanups AND both log calls raising")
+    except BaseException as e:
+        raise AssertionError(f"CancelledError was MASKED by {type(e).__name__}: {e}")
+    else:
+        raise AssertionError("CancelledError did not propagate")
+    finally:
+        viz.logger = orig_logger
+
+
+def test_log_cleanup_failure_never_raises_directly():
+    """Unit-level: the helper swallows anything the logger throws, including BaseException."""
+    orig_logger = viz.logger
+
+    class _BaseBoom:
+        def warning(self, *a, **k):
+            raise KeyboardInterrupt("even a BaseException must not escape")
+
+    viz.logger = _BaseBoom()
+    try:
+        viz._log_cleanup_failure("anything")  # must simply return
+        print("PASS _log_cleanup_failure swallows even a BaseException from the logger")
+    finally:
+        viz.logger = orig_logger
+
+
 def test_partial_insight_is_still_emitted_on_failure():
     """The handler must still do its job when nothing is hostile."""
     llm = _FakeLLM(chunks=("half ", "answer"), raise_after=_OriginalError("boom"))
@@ -269,6 +354,85 @@ def test_grounded_insight_gets_no_disclosure():
     assert text == "The overall average is 3.07."
     assert "couldn't query" not in text
     print("PASS a grounded insight is returned verbatim, with no disclosure")
+
+
+# Substantive sentences ABOUT THE FEEDBACK DATA that happen to contain phrases the old
+# bare-substring marker list matched. Every one of these was DELETED ENTIRELY by that
+# list — silent content loss, not a cosmetic doubling. All must survive untouched.
+_MUST_SURVIVE = (
+    # codex's exact counter-example. The dataset is feedback about a design tool with an
+    # Export feature area, so "not saved" is ordinary prose here.
+    "Reviews marked 'not saved' account for 18% of failures. Timeout reports follow.",
+    "Users could not access their exports in 12% of reviews.",
+    "Work was not saved after the crash, according to 40 reviews.",
+    "Query failed errors account for 12% of support tickets.",
+    "Exports did not succeed for 8% of users.",
+    "Dashboards showed no fresh data for three days.",
+    "Customers were unable to retrieve deleted files.",
+    # The ungrounded prompt explicitly ASKS for this sentence when the chart cannot
+    # answer the question. It is the most important thing the reader learns, and it is
+    # first-person + "cannot" — so the acquisition-verb constraint is what saves it.
+    "I cannot determine the overall average rating from this chart alone.",
+    "I can't calculate an average from the counts shown here.",
+    "Positive reviews lead at 2,760. Negative follow at 2,394.",
+)
+
+# Genuine model-authored disclosures. These must still be deduped, or the reader sees the
+# caveat twice.
+_MUST_STRIP = (
+    "I could not query the underlying data for this question.",
+    "I couldn't query the data.",
+    "I'm unable to access the underlying data for this chart.",
+    "We could not retrieve fresh data for this question.",
+    "I was not able to run the query behind this chart.",
+    "The source query for this chart wasn't saved.",
+    "The chart's underlying query was not saved.",
+    "No query was saved for this chart.",
+)
+
+
+def test_substantive_sentences_are_never_stripped():
+    """
+    FIX 2, the direction that is a real BUG. A false positive deletes analysis and nobody
+    can tell; a miss only doubles the caveat. So these must all pass through untouched.
+    """
+    for text in _MUST_SURVIVE:
+        assert _strip_model_disclosure(text) == text, f"CONTENT LOST: {text!r}"
+    # And end to end: the disclosure is prepended, the finding is still fully present.
+    codex = _MUST_SURVIVE[0]
+    out = _finalize_insight(codex, _DISCLOSURE_QUERY_FAILED)
+    assert out == f"{_DISCLOSURE_QUERY_FAILED} {codex}", out
+    assert "18% of failures" in out and "Timeout reports follow." in out
+    print(f"PASS all {len(_MUST_SURVIVE)} substantive sentences survive the strip intact")
+
+
+def test_genuine_model_disclosures_are_still_deduped():
+    """FIX 2 must not invert: real disclosures still have to be caught."""
+    for text in _MUST_STRIP:
+        assert _strip_model_disclosure(text) != text, f"NOT deduped: {text!r}"
+    # Both code-owned constants, if the model echoed them verbatim.
+    for disc in (_DISCLOSURE_NO_SQL, _DISCLOSURE_QUERY_FAILED):
+        assert _strip_model_disclosure(disc) == "", disc
+    # With a body following, the body survives and the disclosure sentence goes.
+    text = "I could not query the underlying data. Positive reviews lead at 2,760."
+    assert _strip_model_disclosure(text) == "Positive reviews lead at 2,760."
+    out = _finalize_insight(text, _DISCLOSURE_NO_SQL)
+    assert out.count("could not query") + out.count("couldn't query") == 1, out
+    print(f"PASS all {len(_MUST_STRIP)} genuine disclosures are still deduped")
+
+
+def test_a_missed_disclosure_doubles_but_never_loses_content():
+    """
+    The asymmetry, stated as a test. A disclosure phrased so loosely that the patterns
+    miss it must still leave the reader with an HONEST answer — the code-owned caveat
+    plus the model's words — never a silently truncated one.
+    """
+    loose = "No fresh data was available. The chart shows 2,760 positive reviews."
+    assert _strip_model_disclosure(loose) == loose, "under-match expected here"
+    out = _finalize_insight(loose, _DISCLOSURE_QUERY_FAILED)
+    assert out.startswith(_DISCLOSURE_QUERY_FAILED)
+    assert "The chart shows 2,760 positive reviews." in out, out
+    print("PASS a missed disclosure yields a doubled-but-honest answer, never content loss")
 
 
 def test_finalize_and_strip_helpers_directly():

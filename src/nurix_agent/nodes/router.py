@@ -103,10 +103,19 @@ def compose_viz_question(question: str, existing_sql: str | None) -> str:
     supplies carries the wrong nonce and is just more text inside the block. The nonce is
     never returned to the client, so it cannot be learned from a prior response.
 
-    Note this keeps the no-sanitizing property intact — the SQL is still passed through
-    byte-for-byte. The nonce constrains the FRAME, not the content, which is why it is
-    the right fix here: it closes the escape without acquiring the false-positive problem
-    that filtering the SQL would.
+    Note this keeps the no-sanitizing property intact. Stated precisely, because the
+    precise version is the useful one: the SQL's INTERIOR is preserved verbatim — every
+    byte between the first and last non-whitespace character reaches Genie unchanged,
+    including comments, string literals, CTE names, and any forged end marker. The only
+    transformation is `.strip()` on the outer edges, which removes leading and trailing
+    whitespace and nothing else. So this is NOT byte-for-byte identity, and claiming that
+    would be a flattering overstatement of the same kind already corrected elsewhere in
+    this change; it IS the property that actually matters, since no injection depends on
+    surrounding whitespace and no legitimate query is changed in meaning by trimming it.
+
+    The nonce constrains the FRAME, not the content, which is why it is the right fix
+    here: it closes the escape without acquiring the false-positive problem that
+    filtering the SQL would.
     """
     # Short is fine: this only has to be unpredictable to the caller within one request,
     # not globally unique. 8 hex chars is 4 bytes of entropy from a CSPRNG.

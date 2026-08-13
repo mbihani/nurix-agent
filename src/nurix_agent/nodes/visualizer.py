@@ -269,25 +269,109 @@ _DISCLOSURE_QUERY_FAILED = (
 # to drop that leading sentence before the code-owned one is prepended, so the answer
 # does not say the same thing twice.
 #
-# Kept deliberately NARROW — matched only against the FIRST sentence, and only on the
-# ungrounded path where such a sentence IS the disclosure by construction. A broader
-# pattern, or one applied to the whole text, would eventually eat a legitimate sentence.
-_MODEL_DISCLOSURE_MARKERS = (
-    "could not query", "couldn't query", "cannot query", "can't query",
-    "unable to query", "could not access", "couldn't access", "unable to access",
-    "was not saved", "wasn't saved", "not saved", "no fresh data", "without fresh data",
-    "could not retrieve", "couldn't retrieve", "unable to retrieve",
-    "did not succeed", "didn't succeed", "query failed",
+# WHY THESE ARE PATTERNS AND NOT BARE SUBSTRINGS
+# ----------------------------------------------
+# The first version of this was a list of bare phrases — "not saved", "query failed",
+# "could not access", "did not succeed" — tested with `marker in first_sentence`. Every
+# one of those is ALSO ordinary English about the dataset, which is customer feedback
+# about a design tool (Export is one of its feature areas). So:
+#
+#   "Reviews marked 'not saved' account for 18% of failures."
+#   "Users could not access their exports in 12% of reviews."
+#   "Query failed errors account for 12% of support tickets."
+#
+# are substantive findings that the bare list DELETED ENTIRELY. That is silent content
+# loss, not the cosmetic double-caveat the original comment assumed — the precise bug
+# class this endpoint exists to avoid.
+#
+# The discriminator is the SUBJECT, not the phrase. A model-authored disclosure is about
+# THE ASSISTANT failing to acquire data ("I could not query the underlying data") or
+# about THIS CHART'S SOURCE QUERY being unavailable ("the source query wasn't saved").
+# Substantive prose is about USERS and REVIEWS. So a match now requires an explicit
+# first-person subject or an explicit source-QUERY reference.
+#
+# THE FAILURE DIRECTION IS DELIBERATELY ASYMMETRIC, so these patterns UNDER-match on
+# purpose. The code-owned disclosure is prepended either way, so:
+#   * a MISS  -> the reader sees the caveat twice. Ugly, still honest.
+#   * a FALSE POSITIVE -> real analysis is deleted and nobody can tell.
+# Only the second is a correctness bug, so anything ambiguous is left unmatched. Phrases
+# that cannot carry a subject constraint ("no fresh data", "did not succeed", "query
+# failed" standing alone) were DROPPED rather than tightened: a genuine disclosure of a
+# failed query is written in the first person and is still caught by the first pattern.
+_MODEL_DISCLOSURE_PATTERNS = (
+    # (1) FIRST-PERSON inability to ACQUIRE data: "I could not query the underlying
+    #     data", "I'm unable to access the data", "we couldn't retrieve fresh data".
+    #     The verb must be an ACQUISITION verb. Deliberately NOT "determine",
+    #     "calculate" or "answer", because "I cannot determine the average rating from
+    #     this chart alone" is a legitimate, substantive sentence that the ungrounded
+    #     prompt explicitly ASKS the model to write. Stripping it would lose the one
+    #     thing the reader most needs to know.
+    re.compile(
+        r"\b(?:i|we)\b[^.!?]{0,40}?"
+        r"(?:could\s?n[o']?t|can\s?n[o']?t|cannot|can not|unable to|"
+        r"was\s?n[o']?t able to|were\s?n[o']?t able to|did\s?n[o']?t)"
+        r"[^.!?]{0,30}?"
+        r"\b(?:quer(?:y|ied)|access|retrieve|fetch|pull|obtain|run)\b",
+        re.I,
+    ),
+    # (2) THIS CHART'S SOURCE QUERY is unavailable: "the source query for this chart
+    #     wasn't saved", "the chart's underlying query was not stored". An explicit
+    #     QUERY reference is REQUIRED, which is what keeps prose about reviews "marked
+    #     'not saved'" untouched — that sentence contains no query at all.
+    re.compile(
+        r"\b(?:source|chart|original|originating|underlying|generated|stored)\s+"
+        r"quer(?:y|ies)\b[^.!?]{0,60}?"
+        r"(?:was\s?n[o']?t|is\s?n[o']?t|not)\s+"
+        r"(?:saved|stored|available|kept|recorded)",
+        re.I,
+    ),
+    # (3) The same fact stated the other way round: "no query was saved for this chart".
+    re.compile(
+        r"\bno\s+(?:source\s+|chart\s+|underlying\s+)?quer(?:y|ies)\s+"
+        r"(?:was\s+|were\s+)?(?:saved|stored|available|recorded)\b",
+        re.I,
+    ),
 )
+
+
+def _log_cleanup_failure(message: str) -> None:
+    """
+    Log a cleanup failure with NO possibility of raising.
+
+    Called only from the streaming failure handler, in the window between a cleanup step
+    failing and the bare `raise` that re-raises the ORIGINAL exception. Everything in
+    that window must be incapable of raising, or the caller observes the wrong error:
+    a `logger.warning` that raised would surface the LOGGING failure instead of the real
+    cause, and could replace an in-flight `CancelledError` — silently breaking
+    cooperative cancellation, which is worse than the bug the handler exists to fix.
+
+    In practice `logging` already swallows handler errors (`Handler.handleError`), so the
+    trigger is narrow: a monkeypatched logger or a genuinely broken logging setup. This
+    exists anyway because the guarantee stated at the `raise` should be TRUE rather than
+    usually true — the same correction applied to the terminal-insight guarantee, which
+    now names its one exclusion instead of overstating itself. A guarantee with an
+    executable statement sitting inside it is not a guarantee.
+
+    The log is KEPT rather than dropped: losing the diagnostic for an unreportable
+    cleanup failure would be the worse trade.
+    """
+    try:
+        logger.warning(message, exc_info=True)
+    except BaseException:
+        # Nothing left to report through, and re-raising here would defeat the whole
+        # point. `pass` is the only correct action.
+        pass
 
 
 def _strip_model_disclosure(text: str) -> str:
     """
     Drop a leading model-authored disclosure sentence, if it wrote one.
 
-    Only the FIRST sentence is considered, and only when it carries one of the narrow
-    markers above. Everything else is returned untouched — the goal is to avoid a
-    doubled caveat, not to police the model's prose.
+    Only the FIRST sentence is considered, and only when it matches one of the
+    subject-constrained patterns above. Everything else is returned untouched — the goal
+    is to avoid a doubled caveat, not to police the model's prose, and a sentence that
+    merely mentions saving or querying is far more likely to be a real finding about the
+    feedback data than a disclosure. See the patterns for why they under-match.
     """
     stripped = text.lstrip()
     if not stripped:
@@ -296,8 +380,7 @@ def _strip_model_disclosure(text: str) -> str:
     m = re.search(r"(?<=[.!?])\s+|\n", stripped)
     first = stripped[: m.start()] if m else stripped
     rest = stripped[m.end():] if m else ""
-    lowered = first.lower()
-    if any(marker in lowered for marker in _MODEL_DISCLOSURE_MARKERS):
+    if any(p.search(first) for p in _MODEL_DISCLOSURE_PATTERNS):
         # If the disclosure was the ENTIRE answer, keep nothing — the code-owned
         # disclosure alone is a better answer than the same sentence twice.
         return rest.lstrip()
@@ -1051,10 +1134,11 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
                         # The transport itself is broken. There is no channel left to
                         # report anything on, so the only correct action is to let the
                         # ORIGINAL failure propagate untouched. Deliberately not logged
-                        # through `emit` for the same reason.
-                        logger.warning(
+                        # through `emit` for the same reason. Logged via the helper
+                        # because even `logger.warning` must not be able to raise here.
+                        _log_cleanup_failure(
                             "ask_about_viz: could not emit the partial terminal insight; "
-                            "the original error is being re-raised", exc_info=True,
+                            "the original error is being re-raised"
                         )
                 try:
                     span.set_outputs({
@@ -1067,12 +1151,16 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
                 except BaseException:
                     # Tracing is observability, never control flow. A span that cannot
                     # record its outputs must not change what the caller sees.
-                    logger.warning(
-                        "ask_about_viz: could not record failure outputs on the span",
-                        exc_info=True,
+                    _log_cleanup_failure(
+                        "ask_about_viz: could not record failure outputs on the span"
                     )
-                # Bare `raise`: re-raises the ORIGINAL exception, whatever happened in
-                # the cleanup above.
+                # Bare `raise`: re-raises the ORIGINAL exception. This is now
+                # UNCONDITIONAL rather than merely usual — every statement between the
+                # `except BaseException` above and this line is either inside its own
+                # BaseException guard or is `_log_cleanup_failure`, which cannot raise.
+                # Nothing in this window can substitute a different exception, so an
+                # in-flight CancelledError still reaches the caller and cooperative
+                # cancellation keeps working.
                 raise
             # The disclosure is attached HERE, in code, not requested from the model.
             # On the grounded path `disclosure` is None and this is a no-op.
