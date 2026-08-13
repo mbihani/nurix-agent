@@ -24,7 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from nurix_agent.graph import _route_after_router
 from nurix_agent.models import AskAboutVizRequest
 from nurix_agent.nodes.router import compose_viz_question, router_node
-from nurix_agent.nodes.visualizer import _format_genie_result, visualizer_node
+from nurix_agent.nodes.visualizer import (
+    _DISCLOSURE_NO_SQL,
+    _DISCLOSURE_QUERY_FAILED,
+    _format_genie_result,
+    visualizer_node,
+)
 
 CHART_HTML = (
     "<html><head><title>Sentiment by product</title></head><body>"
@@ -284,7 +289,13 @@ def test_grounded_insight_event_is_marked_grounded():
 def test_genie_error_is_surfaced_and_disclosed():
     """
     CARDINAL RULE: never silently degrade. The REAL error text must reach the client,
-    and the answer must be produced under the mandatory-disclosure prompt.
+    and the shipped answer must carry the disclosure.
+
+    This used to assert the PROMPT contained "MUST open your answer by stating", i.e. it
+    checked that the disclosure had been REQUESTED of the model. It now asserts the
+    disclosure is actually PRESENT in the terminal text, because the disclosure moved
+    into code (see `_finalize_insight`). That is a strictly stronger check: the old one
+    passed whenever the instruction was in the prompt, even if the model ignored it.
     """
     state = _viz_state(genie_results=[{
         "text": "", "sql": "", "columns": [], "rows": [],
@@ -295,10 +306,12 @@ def test_genie_error_is_surfaced_and_disclosed():
 
     thinking = " ".join(e["text"] for e in emitted if e["type"] == "thinking")
     assert "PERMISSION_DENIED: warehouse abc is not accessible" in thinking, thinking
-    assert "MUST open your answer by stating" in llm.system_prompts[0]
     insight = [e for e in emitted if e["type"] == "insight"][0]
     assert insight["grounded"] is False
-    print("PASS a Genie error is surfaced verbatim and forces the disclosure prompt")
+    assert insight["text"].startswith(_DISCLOSURE_QUERY_FAILED), insight["text"]
+    # The prompt's job is now only to stop the model DOUBLING the code-owned caveat.
+    assert "ALREADY WRITTEN FOR YOU" in llm.system_prompts[0]
+    print("PASS a Genie error is surfaced verbatim and the answer carries the disclosure")
 
 
 def test_genie_empty_result_is_disclosed_not_dressed_up():
@@ -310,7 +323,9 @@ def test_genie_empty_result_is_disclosed_not_dressed_up():
     _, emitted = _run_visualizer(None, state, llm)
     thinking = " ".join(e["text"] for e in emitted if e["type"] == "thinking")
     assert "no data" in thinking.lower(), thinking
-    assert "MUST open your answer by stating" in llm.system_prompts[0]
+    insight = [e for e in emitted if e["type"] == "insight"][0]
+    assert insight["grounded"] is False
+    assert insight["text"].startswith(_DISCLOSURE_QUERY_FAILED), insight["text"]
     print("PASS an empty Genie result is disclosed, not presented as an answer")
 
 
@@ -324,7 +339,9 @@ def test_missing_sql_is_disclosed_with_its_own_reason():
     _, emitted = _run_visualizer(None, state, llm)
     thinking = " ".join(e["text"] for e in emitted if e["type"] == "thinking")
     assert "not saved" in thinking, thinking
-    assert "MUST open your answer by stating" in llm.system_prompts[0]
+    # The no-SQL case gets its OWN disclosure wording, naming the unsaved source query.
+    insight = [e for e in emitted if e["type"] == "insight"][0]
+    assert insight["text"].startswith(_DISCLOSURE_NO_SQL), insight["text"]
     # Here the chart IS the only source, so it is legitimately supplied.
     assert "CHART_DATA" in llm.user_messages[0]
     print("PASS a missing source query is disclosed with its own distinct reason")

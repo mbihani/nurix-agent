@@ -37,13 +37,34 @@ class _FakeStreamingLLM:
 def test_chunk_text_handles_string_and_block_shapes():
     assert _chunk_text("hello") == "hello"
     assert _chunk_text(None) == ""
-    # Blocks join with NO separator: they are fragments of one sentence.
-    assert _chunk_text([{"type": "text", "text": "par"}, {"type": "text", "text": "tial"}]) == "partial"
     # Non-text blocks (reasoning/tool) are not narrative and must not leak in.
     assert _chunk_text([{"type": "reasoning", "text": "hidden"}, {"type": "text", "text": "shown"}]) == "shown"
     # A block dict without an explicit type is still treated as text.
     assert _chunk_text([{"text": "bare"}]) == "bare"
     print("PASS _chunk_text normalizes string / block / mixed content shapes")
+
+
+def test_chunk_text_joins_blocks_with_a_space_for_terminal_parity():
+    """
+    The list branch MUST join with " ", matching the pre-streaming `" ".join(...)`.
+
+    The reachable path is string-only (measured: 59/59 chunks were `str`), so this
+    separator is inert in practice — which is exactly why parity wins. If the supported
+    list shape is ever reached, the TERMINAL `insight` text must not change from what
+    the pre-streaming code would have produced; that terminal event is what a client
+    ignoring deltas sees, and changing it breaks the additive contract.
+    """
+    assert _chunk_text([{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]) == "first second"
+    assert _chunk_text(["first", "second"]) == "first second"
+    # A single block must not gain a stray separator.
+    assert _chunk_text([{"type": "text", "text": "only"}]) == "only"
+    # Skipped non-text blocks must not leave a doubled separator behind.
+    assert _chunk_text([
+        {"type": "text", "text": "a"},
+        {"type": "reasoning", "text": "drop me"},
+        {"type": "text", "text": "b"},
+    ]) == "a b"
+    print("PASS _chunk_text joins list blocks with ' ' (pre-streaming terminal parity)")
 
 
 def test_stream_text_deltas_emits_pieces_and_returns_full_text():
@@ -138,6 +159,7 @@ def test_genie_stream_carries_no_text_delta_events():
 
 if __name__ == "__main__":
     test_chunk_text_handles_string_and_block_shapes()
+    test_chunk_text_joins_blocks_with_a_space_for_terminal_parity()
     test_stream_text_deltas_emits_pieces_and_returns_full_text()
     test_stream_text_deltas_skips_empty_chunks()
     test_narrative_parts_concatenate_to_narrative()

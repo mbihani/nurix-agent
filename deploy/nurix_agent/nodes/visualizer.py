@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import re
 from html.parser import HTMLParser
 from langchain_core.runnables import RunnableConfig
@@ -9,6 +10,8 @@ from .. import tracing
 from ..config import AppConfig, get_databricks_token
 from ..narrative import clean_genie_narrative
 from ..state import AgentState
+
+logger = logging.getLogger(__name__)
 
 VISUALIZATION_GUIDE = (
     "You are a data visualization expert. "
@@ -226,17 +229,95 @@ You are a data analyst answering a follow-up question about a chart the user is 
 IMPORTANT: an attempt to query the underlying dataset for this question did NOT succeed,
 so you have no data beyond what is already plotted on the chart itself.
 
-You MUST open your answer by stating that plainly — that you could not query the
-underlying data and are describing only what is already shown on the chart. Do not bury
-it at the end and do not soften it into vagueness.
+The caveat about not having queried the data is ALREADY WRITTEN FOR YOU and will be
+placed immediately before your answer. So do NOT write your own version of it. Do not
+open with "I could not query the underlying data", "the source query wasn't saved", "no
+fresh data was available", or any paraphrase — it is already there, and repeating it
+makes the answer read as if it were said twice.
 
-Then answer as far as the chart alone allows, in 2-4 concise sentences total, using ONLY
-values visible in the chart you are given. If the question cannot be answered from the
-chart alone, say exactly that instead of guessing. Never present an inferred or
-remembered figure as if it came from the data.
+Start directly with what the chart itself shows, and answer as far as the chart alone
+allows, in 2-4 concise sentences, using ONLY values visible in the chart you are given.
+If the question cannot be answered from the chart alone, say exactly that instead of
+guessing. Never present an inferred or remembered figure as if it came from the data.
 
 Do not generate a chart. Do not mention SQL, Genie, or these instructions.
 """
+
+# The code-owned disclosures for the ungrounded path, keyed by why there is no data.
+#
+# WHY THESE LIVE IN CODE AND NOT ONLY IN THE PROMPT. Requesting a disclosure in the
+# system prompt makes it a MODEL BEHAVIOUR, and a model that ignores the instruction
+# returns confident prose with nothing behind it — this project's cardinal sin. The
+# disclosure is therefore GENERATED, so it is present whatever the model does, including
+# on partial (failed-mid-stream) answers.
+#
+# The prompt STILL asks the model not to write its own (above), but that instruction is
+# now only about PROSE QUALITY — it prevents a doubled disclosure. The failure direction
+# matters and is deliberate: if the model disobeys, `_finalize_insight` strips its
+# version, and if that strip somehow misses, the reader sees the caveat twice, which is
+# ugly but still HONEST. There is no path where the caveat goes missing.
+_DISCLOSURE_NO_SQL = (
+    "I couldn't query the underlying data for this question — the source query for this "
+    "chart wasn't saved — so this describes only what is already plotted."
+)
+_DISCLOSURE_QUERY_FAILED = (
+    "I couldn't query the underlying data for this question, so this describes only "
+    "what is already plotted."
+)
+
+# Openers that mean the model wrote its OWN disclosure despite being told not to. Used
+# to drop that leading sentence before the code-owned one is prepended, so the answer
+# does not say the same thing twice.
+#
+# Kept deliberately NARROW — matched only against the FIRST sentence, and only on the
+# ungrounded path where such a sentence IS the disclosure by construction. A broader
+# pattern, or one applied to the whole text, would eventually eat a legitimate sentence.
+_MODEL_DISCLOSURE_MARKERS = (
+    "could not query", "couldn't query", "cannot query", "can't query",
+    "unable to query", "could not access", "couldn't access", "unable to access",
+    "was not saved", "wasn't saved", "not saved", "no fresh data", "without fresh data",
+    "could not retrieve", "couldn't retrieve", "unable to retrieve",
+    "did not succeed", "didn't succeed", "query failed",
+)
+
+
+def _strip_model_disclosure(text: str) -> str:
+    """
+    Drop a leading model-authored disclosure sentence, if it wrote one.
+
+    Only the FIRST sentence is considered, and only when it carries one of the narrow
+    markers above. Everything else is returned untouched — the goal is to avoid a
+    doubled caveat, not to police the model's prose.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return text
+    # First sentence boundary: ". " / "! " / "? " / newline, whichever comes first.
+    m = re.search(r"(?<=[.!?])\s+|\n", stripped)
+    first = stripped[: m.start()] if m else stripped
+    rest = stripped[m.end():] if m else ""
+    lowered = first.lower()
+    if any(marker in lowered for marker in _MODEL_DISCLOSURE_MARKERS):
+        # If the disclosure was the ENTIRE answer, keep nothing — the code-owned
+        # disclosure alone is a better answer than the same sentence twice.
+        return rest.lstrip()
+    return text
+
+
+def _finalize_insight(text: str, disclosure: str | None) -> str:
+    """
+    The one place an ungrounded insight gets its disclosure. STRUCTURAL, not prompted.
+
+    `disclosure` is None on the grounded path, where the text passes through untouched —
+    a grounded answer must not acquire a caveat it does not deserve.
+
+    Applied to PARTIAL answers too: a stream that died halfway through an ungrounded
+    answer must not present its fragment as if data backed it.
+    """
+    if disclosure is None:
+        return text
+    body = _strip_model_disclosure(text or "").strip()
+    return f"{disclosure} {body}".strip() if body else disclosure
 
 # How much of Genie's tabular result is handed to the phrasing layer. Follow-up answers
 # are 2-4 sentences, so a wide result adds prompt cost without changing the wording;
@@ -519,21 +600,19 @@ def _chunk_text(content) -> str:
     Flatten one streamed chunk's `content` into plain text.
 
     A chunk carries either a string or a list of content blocks (the same two shapes
-    the non-streaming paths already normalize). Blocks are joined WITHOUT a separator,
-    unlike the whitespace-joining done for complete responses: these are consecutive
-    fragments of one sentence, so inserting spaces between them would corrupt the text
-    as it streams.
+    the non-streaming paths already normalize).
 
-    WHY "" AND NOT " " — and the divergence it theoretically leaves
-    --------------------------------------------------------------
-    The pre-streaming `ask_about_viz` branch normalized list content with
-    `" ".join(...)`. This uses `"".join(...)`, so for a response arriving as two
-    blocks "first"/"second" the old terminal text would have been "first second" and
-    the new one is "firstsecond" — a change to the TERMINAL event, which a client
-    ignoring deltas would see. That would breach the additive-contract guarantee.
+    WHY THE LIST BRANCH JOINS WITH " "
+    ----------------------------------
+    To preserve EXACT parity with the pre-streaming terminal text. The pre-streaming
+    `ask_about_viz` branch normalized list content with `" ".join(...)`. Any different
+    separator here would change the TERMINAL `insight` event for a list-shaped
+    response — visible to a client that ignores deltas — which is precisely the
+    additive-contract breach this module promises cannot happen.
 
-    MEASURED against the live AI Gateway (`databricks-claude-sonnet-5` via
-    cfg.ai_gateway_url, 2026-08-10), which is the only surface this code path talks to:
+    THE REACHABLE PATH IS STRING-ONLY, so the separator is INERT there. Measured
+    against the live AI Gateway (`databricks-claude-sonnet-5` via cfg.ai_gateway_url,
+    2026-08-10), the only surface this code path talks to:
       * `astream`: 59 of 59 `AIMessageChunk.content` values were plain `str`.
         ZERO list-shaped chunks. (A second run: 42 deltas / 538 chars, same shape.)
       * `ainvoke`: `.content` was `str` (642 chars), not a list.
@@ -541,14 +620,14 @@ def _chunk_text(content) -> str:
     `choices[].delta.content`, which is a string field, so `str` is the structural
     outcome for this gateway rather than a lucky sample.
 
-    So the list branch is NOT REACHED in practice and the divergence is THEORETICAL —
-    stated plainly rather than papered over. `""` is kept because it is the correct
-    join for the shape that would actually produce a list here (consecutive fragments
-    of one sentence, where injected spaces corrupt the text mid-stream); reverting to
-    `" "` to match the old terminal string would fix a divergence that cannot occur
-    at the cost of corrupting the case that could. If a future gateway DOES start
-    returning multi-block chunks, revisit this together with the terminal-event
-    comparison — the two must be decided as one.
+    But the helper explicitly ACCEPTS LangChain's supported list-shaped
+    `AIMessageChunk.content`, and Responses-style content blocks, a future gateway
+    normalization, or another compatible adapter could reach it. Since the branch
+    cannot be reached today, `" "` costs the reachable string-only path exactly
+    nothing while restoring parity if it ever is reached — strictly safer than betting
+    on a hypothesis about what block semantics such a future shape would carry. Do not
+    "optimize" this to `""` on the theory that blocks are always mid-sentence
+    fragments: that theory is untestable here, and parity is not.
     """
     if content is None:
         return ""
@@ -564,7 +643,10 @@ def _chunk_text(content) -> str:
                     out.append(b["text"])
             elif isinstance(b, str):
                 out.append(b)
-        return "".join(out)
+        # " " NOT "": parity with the pre-streaming `" ".join(...)` terminal text.
+        # See the docstring — this branch is unreachable on the current gateway, so the
+        # separator is inert in practice and parity is the only thing it can affect.
+        return " ".join(out)
     return str(content)
 
 
@@ -599,9 +681,19 @@ async def _stream_text_deltas(llm, messages, on_delta) -> str:
         try/except, and emits its terminal event from the accumulated text on the way
         out. See the `ask_about_viz` branch in visualizer_node for the authoritative
         statement of the resulting client contract.
-      * The rule a client can rely on is unconditional: EVERY stream that emitted at
-        least one delta is followed by a terminal event that supersedes those deltas,
-        whether the stream succeeded or failed.
+      * The rule a client can rely on, stated with its ONE exclusion: every stream that
+        emitted at least one delta is followed by a terminal event superseding those
+        deltas — succeeded or failed — EXCEPT when the transport itself is what failed.
+        No code can deliver an event through a broken emitter, so the guarantee is
+        conditional on the emitter working, and it is stated that way on purpose. An
+        overstated guarantee is worse than an honest one: a client told the terminal
+        event is unconditional would never handle the case where it does not arrive.
+      * The concrete instance of that exclusion: on CLIENT DISCONNECT the handler does
+        try to queue the partial terminal `insight`, but the SSE generator is already in
+        its `finally` by then, so the event is never delivered. That is INHERENT to
+        cancellation, not a bug with a fix — the socket is gone. It is written down here
+        rather than papered over. (It is also harmless: nothing is left rendering,
+        because the thing that would render it is what disconnected.)
 
     Accumulating here as well (rather than only in the caller) keeps the returned text
     the single source of truth for the SUCCESS-path terminal event.
@@ -758,9 +850,30 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
         genie_results = state.get("genie_results") or []
         genie_result = genie_results[0] if genie_results else {}
         genie_error = genie_result.get("error")
-        has_data = bool(genie_result.get("rows")) or bool((genie_result.get("text") or "").strip())
         had_sql = bool((state.get("existing_sql") or "").strip())
-        grounded = bool(genie_results) and has_data and not genie_error
+
+        # `grounded` REQUIRES POSITIVE EVIDENCE THAT A QUERY ACTUALLY RAN.
+        #
+        # It used to accept narrative text alone, which was too loose: Genie can return
+        # a text attachment with NO rows and NO generated SQL — `_process_message` even
+        # falls back to the query attachment's `description` for the narrative — and
+        # prose is not proof that anything was executed. Marking that grounded is the
+        # silent-degradation shape in its most dangerous form: a confident answer,
+        # flagged as data-backed, with no query behind it.
+        #
+        # So the evidence must be STRUCTURAL: rows came back, or Genie emitted the SQL
+        # it ran. Narrative is then used as the phrasing source, but never as the proof.
+        # (Rows OR SQL rather than rows alone because a legitimately empty result set —
+        # "no reviews match that filter" — is a real answer, and its generated SQL is
+        # the evidence the question was actually put to the data.)
+        ran_a_query = bool(genie_result.get("rows")) or bool((genie_result.get("sql") or "").strip())
+        has_narrative = bool((genie_result.get("text") or "").strip())
+        grounded = bool(genie_results) and ran_a_query and not genie_error
+
+        # None on the grounded path. Otherwise the code-owned disclosure text that
+        # `_finalize_insight` puts in front of EVERY terminal insight on this path,
+        # including a partial one — see BLOCKER 3 in the docstrings above.
+        disclosure: str | None = None
 
         if grounded:
             system_prompt = INSIGHT_GENIE_SYSTEM_PROMPT
@@ -785,13 +898,24 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
                     "The source query for this chart was not saved, so the underlying "
                     "data could not be queried for this question."
                 )
+                disclosure = _DISCLOSURE_NO_SQL
             elif genie_error:
                 reason = f"Genie could not answer this question: {str(genie_error)[:300]}"
+                disclosure = _DISCLOSURE_QUERY_FAILED
+            elif has_narrative:
+                # Genie replied in prose but produced neither rows nor SQL, so nothing
+                # proves a query ran. The narrative is NOT presented as data.
+                reason = (
+                    "Genie replied but did not run a query for this question (no rows "
+                    "and no SQL), so its answer is not backed by the data."
+                )
+                disclosure = _DISCLOSURE_QUERY_FAILED
             else:
                 reason = (
                     "Genie returned no data for this question, so there is nothing "
                     "beyond the chart itself to answer from."
                 )
+                disclosure = _DISCLOSURE_QUERY_FAILED
             emit({"type": "thinking", "text": reason})
             user_msg = (
                 f"The user's question about the chart: {state['question']}\n\n"
@@ -829,10 +953,25 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
             #
             # RULE: `insight_delta` is a progressive PREVIEW and is never the final
             # word. The terminal `insight` event REPLACES the client's accumulated
-            # delta text — it is never appended to. A terminal `insight` ALWAYS
-            # follows at least one `insight_delta`, on the success path AND on the
-            # failure path. A client may therefore render deltas immediately and
-            # unconditionally rely on being told what the real text is.
+            # delta text — it is never appended to. A terminal `insight` follows at
+            # least one `insight_delta` on the success path AND on the failure path, so
+            # a client may render deltas immediately and rely on being told what the
+            # real text is.
+            #
+            # THE ONE EXCLUSION, stated rather than glossed: this holds only while the
+            # TRANSPORT works. No code can deliver an event through a failed emitter, so
+            # "a terminal event always arrives" is conditional on the emitter, not
+            # absolute. Concretely, on CLIENT DISCONNECT the handler does attempt the
+            # partial terminal emit, but the SSE generator is already in its `finally`
+            # and the event is never delivered — inherent to cancellation, not fixable,
+            # and harmless (whatever would have rendered it is what disconnected). An
+            # overstated guarantee would be worse than this honest one: a client told the
+            # terminal event is unconditional would never handle its absence.
+            #
+            # REPLACE-not-append is also load-bearing for a reason beyond post-
+            # processing: on the UNGROUNDED path the terminal text carries a code-owned
+            # disclosure prefix that the deltas do not have. A client that appended would
+            # silently drop the caveat.
             #
             # The three sequences a client must handle:
             #
@@ -883,40 +1022,82 @@ async def visualizer_node(state: AgentState, config: RunnableConfig) -> dict:
                 # but a client disconnect cancels this task and raises CancelledError,
                 # which is NOT an Exception. Both leave the same orphaned partial on a
                 # client that was rendering deltas, so both must emit the terminal
-                # correction. The error is always RE-RAISED — this recovers the client
-                # contract, it does not swallow the failure. run_graph still turns it
-                # into the `error` event that reports the real cause.
+                # correction.
+                #
+                # THE ORIGINAL EXCEPTION IS PRESERVED UNCONDITIONALLY. Every cleanup
+                # step below is individually guarded and its own failure is SWALLOWED,
+                # because the alternative is worse in both directions:
+                #   * an `emit` that raises would otherwise mask the real cause AND
+                #     still leave the client's partial text uncorrected;
+                #   * a `span.set_outputs` that raises would otherwise replace the
+                #     in-flight exception before the bare `raise` — turning a genuine
+                #     CancelledError into an unrelated error and breaking cooperative
+                #     cancellation, which is worse than the bug this handler fixes.
+                # Best-effort cleanup, then an unconditional bare `raise`. Nothing
+                # between here and that `raise` is allowed to substitute an exception.
                 partial = "".join(deltas).strip()
                 if partial:
-                    emit({
-                        "type": "insight",
-                        "text": partial,
+                    try:
+                        emit({
+                            "type": "insight",
+                            # Disclosed even on a partial: a fragment of an ungrounded
+                            # answer must not look data-backed either.
+                            "text": _finalize_insight(partial, disclosure),
+                            "partial": True,
+                            "grounded": grounded,
+                            "error": str(e) or type(e).__name__,
+                        })
+                    except BaseException:
+                        # The transport itself is broken. There is no channel left to
+                        # report anything on, so the only correct action is to let the
+                        # ORIGINAL failure propagate untouched. Deliberately not logged
+                        # through `emit` for the same reason.
+                        logger.warning(
+                            "ask_about_viz: could not emit the partial terminal insight; "
+                            "the original error is being re-raised", exc_info=True,
+                        )
+                try:
+                    span.set_outputs({
+                        "insight_chars": len(partial),
+                        "delta_chunks": len(deltas),
                         "partial": True,
-                        "error": str(e) or type(e).__name__,
+                        "grounded_in_genie": grounded,
+                        "error": tracing.truncate(str(e) or type(e).__name__),
                     })
-                span.set_outputs({
-                    "insight_chars": len(partial),
-                    "delta_chunks": len(deltas),
-                    "partial": True,
-                    "error": tracing.truncate(str(e) or type(e).__name__),
-                })
+                except BaseException:
+                    # Tracing is observability, never control flow. A span that cannot
+                    # record its outputs must not change what the caller sees.
+                    logger.warning(
+                        "ask_about_viz: could not record failure outputs on the span",
+                        exc_info=True,
+                    )
+                # Bare `raise`: re-raises the ORIGINAL exception, whatever happened in
+                # the cleanup above.
                 raise
-            insight = insight.strip()
+            # The disclosure is attached HERE, in code, not requested from the model.
+            # On the grounded path `disclosure` is None and this is a no-op.
+            insight = _finalize_insight(insight.strip(), disclosure)
             span.set_outputs({
                 "insight_chars": len(insight),
                 "delta_chunks": len(deltas),
                 "partial": False,
                 "grounded_in_genie": grounded,
+                "disclosed": disclosure is not None,
             })
         # TERMINAL event, unchanged in shape (`partial: false` is additive) and still
         # carrying the FULL text. A client that ignores `insight_delta` sees exactly
         # the old sequence. See the contract block above for the failure sequences.
         #
+        # NOTE the terminal text can now differ from the concatenated deltas by the
+        # code-owned disclosure prefix. That is exactly what REPLACE-not-append is for,
+        # and it is the reason the terminal event is authoritative: a client that renders
+        # deltas live sees the model's words, then gets the disclosed version as the
+        # final answer. Appending instead of replacing would drop the caveat.
+        #
         # `grounded` is ADDITIVE and advisory: it lets a client mark an answer that has
-        # no fresh data behind it without having to parse the prose for a disclosure.
-        # The disclosure is ALSO in the text itself (the prompt mandates it), so a
-        # client that ignores this field still shows the user an honest answer — the
-        # field is a convenience, never the only place the caveat lives.
+        # no fresh data behind it without parsing the prose. The disclosure is ALSO in
+        # the text itself — and, since BLOCKER 3, put there by CODE rather than by the
+        # prompt — so a client that ignores this field still shows an honest answer.
         emit({"type": "insight", "text": insight, "partial": False, "grounded": grounded})
         return {"insight_text": insight}
 
